@@ -1,0 +1,543 @@
+# coding: utf-8
+"""
+Analyze wechat-article-claw output JSON files and generate report files.
+
+Default behavior:
+  1. Scan ./wechat-article-claw/output/*.json
+  2. Ask the user to choose one JSON file
+  3. Re-fetch article pages and extract text, images, links, and assets
+  4. Write reports to this script's directory
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
+from bs4 import BeautifulSoup
+
+
+BASE_DIR = Path(__file__).resolve().parent
+CLAW_DIR = BASE_DIR / "wechat-article-claw"
+DEFAULT_OUTPUT_JSON_DIR = CLAW_DIR / "output"
+
+if CLAW_DIR.exists():
+    sys.path.insert(0, str(CLAW_DIR))
+
+try:
+    from read_wechat_article import WechatArticleFetcher, WechatArticleParser
+except ImportError as exc:
+    print(f"[x] 无法导入 wechat-article-claw/read_wechat_article.py: {exc}")
+    print(f"[x] 请确认项目目录存在: {CLAW_DIR}")
+    raise
+
+
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>，。；；、）)]+", re.I)
+IMAGE_HOSTS = {"mmbiz.qpic.cn", "mmbiz.qlogo.cn", "wx.qlogo.cn"}
+MINIPROGRAM_HINTS = (
+    "weapp",
+    "miniprogram",
+    "data-miniprogram",
+    "weapp_username",
+    "weapp_path",
+)
+
+
+def safe_filename(value):
+    value = (value or "unknown").strip()
+    value = re.sub(r'[\\/:*?"<>|\s]+', "_", value)
+    return value.strip("_") or "unknown"
+
+
+def normalize_url(url):
+    return html.unescape(html.unescape(url or "")).replace("\\/", "/").strip()
+
+
+def get_hostname(url):
+    return (urlparse(url).hostname or "").lower()
+
+
+def is_http_url(url):
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def decode_wechat_redirect(url):
+    parsed = urlparse(url)
+    if parsed.hostname != "mp.weixin.qq.com":
+        return url
+    query = parse_qs(parsed.query)
+    for key in ("url", "target", "redirect_url"):
+        values = query.get(key)
+        if values and values[0]:
+            return normalize_url(unquote(values[0]))
+    return url
+
+
+def classify_url(url):
+    host = get_hostname(url)
+    path = urlparse(url).path.lower()
+    if host in IMAGE_HOSTS or path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")):
+        return "image"
+    if host == "mp.weixin.qq.com":
+        return "wechat_link"
+    if "qq.com" in host or "weixin.qq.com" in host:
+        return "wechat_asset"
+    if path.endswith((".mp4", ".mov", ".m3u8", ".mp3", ".wav")):
+        return "media"
+    if path.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar")):
+        return "file"
+    return "external_url"
+
+
+def list_output_jsons(output_dir):
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir():
+        return []
+    return sorted(output_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def choose_input_file(output_dir):
+    files = list_output_jsons(output_dir)
+    if not files:
+        print(f"[x] 没有发现 JSON 文件: {output_dir}")
+        sys.exit(1)
+
+    print(f"\n发现 {len(files)} 个 JSON 文件: {output_dir}")
+    for index, path in enumerate(files, 1):
+        size = path.stat().st_size
+        mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {index}. {path.name}  ({size} bytes, {mtime})")
+
+    while True:
+        value = input("\n选择编号: ").strip()
+        if value.isdigit() and 1 <= int(value) <= len(files):
+            return files[int(value) - 1]
+        print("请输入有效编号。")
+
+
+def load_articles(json_path):
+    with open(json_path, "r", encoding="utf-8") as fp:
+        data = json.load(fp)
+
+    if isinstance(data, list):
+        return "unknown", data
+    if isinstance(data, dict):
+        return data.get("account") or data.get("nickname") or "unknown", data.get("articles", [])
+    raise ValueError("Unsupported JSON format")
+
+
+def article_url(article):
+    return normalize_url(
+        article.get("url")
+        or article.get("link")
+        or article.get("content_url")
+        or article.get("source_url")
+        or article.get("article_url")
+        or ""
+    )
+
+
+def normalize_article(url):
+    url = normalize_url(url)
+    if url.startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def article_container(soup):
+    for kwargs in ({"id": "js_content"}, {"id": "img-content"}, {"class_": "rich_media_content"}):
+        node = soup.find(**kwargs)
+        if node is not None:
+            return node
+    return soup
+
+
+def add_asset(assets, seen, article_index, article, resource_type, value, source, context=""):
+    value = decode_wechat_redirect(normalize_url(value))
+    if not value or not is_http_url(value):
+        return
+    key = (article_index, resource_type, value)
+    if key in seen:
+        return
+    seen.add(key)
+    assets.append(
+        {
+            "article_index": article_index,
+            "article_title": article.get("title", ""),
+            "article_url": article.get("url", ""),
+            "resource_type": resource_type,
+            "resource_value": value,
+            "host": get_hostname(value),
+            "source": source,
+            "context": context,
+        }
+    )
+
+
+def extract_miniprograms(container):
+    results = []
+    seen = set()
+    for tag in container.find_all(True):
+        attrs = {key: value for key, value in tag.attrs.items() if isinstance(value, str)}
+        joined = " ".join([tag.name, *attrs.keys(), *attrs.values()])
+        if not any(hint in joined for hint in MINIPROGRAM_HINTS):
+            continue
+        appid = attrs.get("data-miniprogram-appid") or attrs.get("data-weappid") or attrs.get("appid") or ""
+        username = attrs.get("weapp_username") or attrs.get("data-weapp-username") or ""
+        path = attrs.get("data-miniprogram-path") or attrs.get("data-weapp-path") or attrs.get("weapp_path") or ""
+        label = tag.get_text(" ", strip=True)
+        value = {"appid": appid, "username": username, "path": path, "label": label}
+        key = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if (appid or username or path) and key not in seen:
+            seen.add(key)
+            results.append(value)
+    return results
+
+
+def extract_assets_from_html(page_html, article_index, detail):
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    container = article_container(soup)
+    assets = []
+    seen = set()
+
+    url_attrs = ("href", "src", "data-src", "data-original", "data-backsrc", "poster")
+    for tag in container.find_all(True):
+        for attr in url_attrs:
+            raw = tag.get(attr)
+            if not raw:
+                continue
+            value = normalize_url(urljoin(detail["url"], raw))
+            add_asset(assets, seen, article_index, detail, classify_url(value), value, f"html_{attr}", tag.get_text(" ", strip=True))
+
+        style = tag.get("style")
+        if style:
+            for raw in re.findall(r"url\(([^)]+)\)", style, re.I):
+                value = normalize_url(urljoin(detail["url"], raw.strip("'\" ")))
+                add_asset(assets, seen, article_index, detail, classify_url(value), value, "inline_style")
+
+    container_html = str(container)
+    for raw in URL_PATTERN.findall(container_html):
+        value = decode_wechat_redirect(normalize_url(raw))
+        add_asset(assets, seen, article_index, detail, classify_url(value), value, "html_text")
+
+    miniprograms = extract_miniprograms(container)
+    for item in miniprograms:
+        pseudo_value = "weapp://appid={appid};username={username};path={path}".format(**item)
+        key = (article_index, "miniprogram", pseudo_value)
+        if key not in seen:
+            seen.add(key)
+            assets.append(
+                {
+                    "article_index": article_index,
+                    "article_title": detail.get("title", ""),
+                    "article_url": detail.get("url", ""),
+                    "resource_type": "miniprogram",
+                    "resource_value": pseudo_value,
+                    "host": "wechat_miniprogram",
+                    "source": "html_miniprogram",
+                    "context": item.get("label", ""),
+                }
+            )
+
+    return assets, miniprograms
+
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, ensure_ascii=False, indent=2)
+
+
+def dedupe_articles(articles):
+    result = []
+    seen = set()
+    for article in articles:
+        url = normalize_article(article_url(article))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        copied = dict(article)
+        copied["url"] = url
+        result.append(copied)
+    return result
+
+
+def analyze_articles(articles, account, args):
+    fetcher = WechatArticleFetcher(timeout=args.timeout, max_retries=args.retries, retry_delay=args.retry_delay)
+    parser = WechatArticleParser()
+    selected = dedupe_articles(articles)
+    if args.max:
+        selected = selected[: args.max]
+
+    details = []
+    all_assets = []
+    all_images = []
+    logs = []
+    total = len(selected)
+    print(f"\n开始分析 {account}: {total} 篇")
+
+    for index, raw_article in enumerate(selected, 1):
+        original_url = raw_article["url"]
+        title_hint = raw_article.get("title", "")
+        log_item = {"index": index, "title": title_hint, "url": original_url, "status": "pending"}
+        print(f"  [{index}/{total}] {title_hint[:40] or original_url[:60]}")
+
+        detail = {
+            "index": index,
+            "title": title_hint,
+            "author": raw_article.get("author", ""),
+            "pub_time": raw_article.get("pub_time") or raw_article.get("update_time") or "",
+            "url": original_url,
+            "content": raw_article.get("content") or "",
+            "content_length": len(raw_article.get("content") or ""),
+            "fetch_status": "from_input",
+            "assets_count": 0,
+            "images_count": 0,
+            "miniprograms_count": 0,
+        }
+
+        page_html = ""
+        if args.refetch:
+            fetched = fetcher.fetch(original_url)
+            if "error" in fetched:
+                detail.update({"fetch_status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
+                log_item.update({"status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
+            else:
+                page_html = fetched.get("page_html", "")
+                parsed = parser.parse(page_html)
+                content = parsed.get("content") or detail["content"]
+                detail.update(
+                    {
+                        "title": parsed.get("title") or detail["title"],
+                        "author": parsed.get("author") or detail["author"],
+                        "pub_time": parsed.get("pub_time") or detail["pub_time"],
+                        "url": fetched.get("source_url") or detail["url"],
+                        "content": content,
+                        "content_length": len(content or ""),
+                        "fetch_status": "ok",
+                    }
+                )
+                log_item.update({"status": "ok", "http_status": fetched.get("status")})
+        else:
+            log_item.update({"status": "ok", "note": "no_refetch"})
+
+        if page_html:
+            assets, miniprograms = extract_assets_from_html(page_html, index, detail)
+            detail["assets_count"] = len(assets)
+            detail["images_count"] = sum(1 for item in assets if item["resource_type"] == "image")
+            detail["miniprograms_count"] = len(miniprograms)
+            all_assets.extend(assets)
+            all_images.extend([item for item in assets if item["resource_type"] == "image"])
+
+        details.append(detail)
+        logs.append(log_item)
+        if args.delay and index < total:
+            time.sleep(args.delay)
+
+    return details, all_assets, all_images, logs
+
+
+def unique_network_assets(assets):
+    seen = set()
+    rows = []
+    for item in assets:
+        value = item["resource_value"]
+        if value in seen:
+            continue
+        seen.add(value)
+        rows.append(
+            {
+                "resource_value": value,
+                "resource_type": item["resource_type"],
+                "host": item.get("host", ""),
+                "first_article_title": item.get("article_title", ""),
+                "first_article_url": item.get("article_url", ""),
+            }
+        )
+    return rows
+
+
+def write_asset_text(path, rows, title):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(title + "\n")
+        fp.write("=" * 80 + "\n\n")
+        if not rows:
+            fp.write("未发现。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"[{index}] {item.get('resource_value', '')}\n")
+            fp.write(f"类型：{item.get('resource_type', '')}\n")
+            fp.write(f"域名：{item.get('host', '')}\n")
+            fp.write(f"来源文章：{item.get('article_title') or item.get('first_article_title', '')}\n")
+            fp.write(f"文章URL：{item.get('article_url') or item.get('first_article_url', '')}\n")
+            if item.get("source"):
+                fp.write(f"提取位置：{item.get('source')}\n")
+            if item.get("context"):
+                fp.write(f"上下文：{item.get('context')}\n")
+            fp.write("\n")
+
+
+def save_reports(report_dir, account, source_file, details, assets, images, logs, keep_json=False):
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = report_dir / "图片资源"
+    asset_dir = report_dir / "资产明细"
+    image_dir.mkdir(exist_ok=True)
+    asset_dir.mkdir(exist_ok=True)
+    network = unique_network_assets(assets)
+
+    type_counts = {}
+    host_counts = {}
+    for item in assets:
+        type_counts[item["resource_type"]] = type_counts.get(item["resource_type"], 0) + 1
+        host = item.get("host") or "unknown"
+        host_counts[host] = host_counts.get(host, 0) + 1
+
+    summary = {
+        "account": account,
+        "source_file": str(source_file),
+        "generated_at": datetime.now().isoformat(),
+        "articles": len(details),
+        "success": sum(1 for item in details if item.get("fetch_status") == "ok"),
+        "assets": len(assets),
+        "unique_network_assets": len(network),
+        "images": len(images),
+        "errors": sum(1 for item in details if item.get("fetch_status") == "error"),
+    }
+
+    with open(report_dir / "分析报告.md", "w", encoding="utf-8") as fp:
+        fp.write(f"# {account} 分析报告\n\n")
+        fp.write("## 基本信息\n\n")
+        fp.write(f"- 来源文件：{source_file}\n")
+        fp.write(f"- 生成时间：{summary['generated_at']}\n")
+        fp.write(f"- 文章数量：{summary['articles']}\n")
+        fp.write(f"- 成功重新获取详情：{summary['success']}\n")
+        fp.write(f"- 获取失败：{summary['errors']}\n")
+        fp.write(f"- 发现资源总数：{summary['assets']}\n")
+        fp.write(f"- 唯一网络资产：{summary['unique_network_assets']}\n")
+        fp.write(f"- 图片资源：{summary['images']}\n\n")
+
+        fp.write("## 资源类型统计\n\n")
+        if type_counts:
+            for name, count in sorted(type_counts.items(), key=lambda kv: kv[0]):
+                fp.write(f"- {name}：{count}\n")
+        else:
+            fp.write("- 未发现资源\n")
+
+        fp.write("\n## 域名统计\n\n")
+        if host_counts:
+            for host, count in sorted(host_counts.items(), key=lambda kv: kv[1], reverse=True):
+                fp.write(f"- {host}：{count}\n")
+        else:
+            fp.write("- 未发现域名\n")
+
+        fp.write("\n## 文章详情\n\n")
+        for item in details:
+            fp.write(f"### [{item.get('index')}] {item.get('title') or '无标题'}\n\n")
+            fp.write(f"- URL：{item.get('url')}\n")
+            fp.write(f"- 作者：{item.get('author') or '未知'}\n")
+            fp.write(f"- 时间：{item.get('pub_time') or '未知'}\n")
+            fp.write(f"- 正文字数：{item.get('content_length', 0)}\n")
+            fp.write(f"- 资源数量：{item.get('assets_count', 0)}\n")
+            fp.write(f"- 图片数量：{item.get('images_count', 0)}\n")
+            fp.write(f"- 小程序数量：{item.get('miniprograms_count', 0)}\n")
+            if item.get("error"):
+                fp.write(f"- 错误：{item.get('error')} {item.get('message', '')}\n")
+            content = (item.get("content") or "").strip()
+            if content:
+                fp.write("\n正文摘录：\n\n")
+                fp.write(content[:1200])
+                if len(content) > 1200:
+                    fp.write("\n\n...（正文过长，已截断）")
+            fp.write("\n\n")
+
+    with open(report_dir / "网络资产.txt", "w", encoding="utf-8") as fp:
+        for item in network:
+            fp.write(item["resource_value"] + "\n")
+
+    write_asset_text(image_dir / "图片资源清单.txt", images, "图片资源清单")
+    write_asset_text(asset_dir / "全部资产清单.txt", assets, "全部资产清单")
+
+    assets_by_type = {}
+    for item in assets:
+        assets_by_type.setdefault(item.get("resource_type") or "unknown", []).append(item)
+    for resource_type, rows in sorted(assets_by_type.items()):
+        write_asset_text(asset_dir / f"{safe_filename(resource_type)}.txt", rows, f"{resource_type} 清单")
+
+    with open(report_dir / "运行日志.txt", "w", encoding="utf-8") as fp:
+        fp.write(f"公众号：{account}\n")
+        fp.write(f"来源文件：{source_file}\n")
+        fp.write(f"生成时间：{summary['generated_at']}\n\n")
+        for item in logs:
+            fp.write("[{index}] {status} {title}\n".format(**item))
+            fp.write(f"URL：{item.get('url', '')}\n")
+            if item.get("error"):
+                fp.write(f"错误：{item.get('error')}\n")
+            if item.get("message"):
+                fp.write(f"说明：{item.get('message')}\n")
+            if item.get("http_status") is not None:
+                fp.write(f"HTTP状态：{item.get('http_status')}\n")
+            fp.write("\n")
+
+    if keep_json:
+        write_json(report_dir / "原始详情.json", details)
+        write_json(report_dir / "原始资源.json", assets)
+        write_json(report_dir / "原始日志.json", logs)
+
+    return summary
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="选择 wechat-article-claw/output JSON 并生成公众号文章资产报告")
+    parser.add_argument("-i", "--input", help="指定 JSON 文件；不指定则交互选择")
+    parser.add_argument("-o", "--output-dir", help="报告输出目录；默认在当前目录生成")
+    parser.add_argument("--project-dir", default=str(CLAW_DIR), help="wechat-article-claw 项目目录")
+    parser.add_argument("--output-json-dir", default=None, help="JSON 输出目录；默认 project-dir/output")
+    parser.add_argument("--max", type=int, default=None, help="最多处理文章数")
+    parser.add_argument("--delay", type=float, default=1.0, help="每篇间隔秒数")
+    parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retry-delay", type=float, default=1.0)
+    parser.add_argument("--no-refetch", dest="refetch", action="store_false", help="不重新请求页面，仅整理已有 JSON")
+    parser.add_argument("--keep-json", action="store_true", help="额外保留原始 JSON 明细")
+    parser.set_defaults(refetch=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    project_dir = Path(args.project_dir).resolve()
+    output_json_dir = Path(args.output_json_dir).resolve() if args.output_json_dir else project_dir / "output"
+    source_file = Path(args.input).resolve() if args.input else choose_input_file(output_json_dir)
+
+    if not source_file.exists():
+        print(f"[x] 文件不存在: {source_file}")
+        return 1
+
+    account, articles = load_articles(source_file)
+    if not articles:
+        print(f"[x] 没有文章: {source_file}")
+        return 1
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = Path(args.output_dir).resolve() if args.output_dir else BASE_DIR / f"{safe_filename(account)}_analysis_{timestamp}"
+    details, assets, images, logs = analyze_articles(articles, account, args)
+    summary = save_reports(report_dir, account, source_file, details, assets, images, logs, keep_json=args.keep_json)
+
+    print("\n完成")
+    print(f"报告目录: {report_dir}")
+    print(f"文章数: {summary['articles']}")
+    print(f"成功详情: {summary['success']}")
+    print(f"图片数: {summary['images']}")
+    print(f"网络资产: {summary['unique_network_assets']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

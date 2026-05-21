@@ -1,0 +1,20 @@
+account=宝医heart
+source_file=D:\tmp\anjian\pj\st\tmp\tmp\微信公众号爬取\wechat-article-claw\output\宝医heart_full_20260521_172329.json
+generated_at=2026-05-21T18:18:32.915535
+articles=5
+success=5
+assets=18
+unique_network_assets=10
+images=6
+errors=0
+
+[1] ok 争分夺秒！宝医心血管外科团队连续打赢4场“生命保卫战” https://mp.weixin.qq.com/s?__biz=MzkzMTkxNTIzMQ%3D%3D&mid=2247483735&idx=1&sn=14eb9df93973de9646bf83150993f4c0&chksm=c262f5e7f5157cf1ed28d418895fc131de914417fa57ae36e4521d3098ce4927465fa7756650#rd
+  http_status=200
+[2] ok 多学科协作攻克难题：冠心病合并骨折患者在我院成功获治 https://mp.weixin.qq.com/s?__biz=MzkzMTkxNTIzMQ%3D%3D&mid=2247483727&idx=1&sn=3b767dc1794de75f6a3cbb02a101886a&chksm=c262f5fff5157ce99f7892fd8d4ac2b24abb089350b4258690700cd98b8e20c52840ea60e706#rd
+  http_status=200
+[3] ok 宝医HEART系列访谈---冠脉搭桥（一：冠脉搭桥的历史） https://mp.weixin.qq.com/s?__biz=MzkzMTkxNTIzMQ%3D%3D&mid=2247483672&idx=1&sn=3bf6b83f8a1fbec171177d543e1a2252&chksm=c262f5a8f5157cbece092b736103161e787c4adb5f07f47aa3b99365972149d697801fbdf7fa#rd
+  http_status=200
+[4] ok 宝医HEART系列访谈---华法林的使用（二） https://mp.weixin.qq.com/s?__biz=MzkzMTkxNTIzMQ%3D%3D&mid=2247483658&idx=1&sn=7e752116880f003d4d560ce50faa809e&chksm=c262f5baf5157caccfda73da94384f46fa5524b94ade40507c1e0da204b59d6fd8ddff95a13d#rd
+  http_status=200
+[5] ok 宝医HEART系列访谈---华法林的使用（一） https://mp.weixin.qq.com/s?__biz=MzkzMTkxNTIzMQ%3D%3D&mid=2247483653&idx=1&sn=0f8401a030a40e0f87bf80887f9d1dc6&chksm=c262f5b5f5157ca38b57378e571a6549f2b4bf8c654b8dc763c3b06e9248298c732894fa7787#rd
+  http_status=200

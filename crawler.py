@@ -199,7 +199,7 @@ def run_analysis_report(nickname, full_output_file, articles, report_dir, settin
     return summary
 
 
-def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=None, since_date=None):
+def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=None, since_date=None, output_name=None):
     """
     抓取指定公众号的全部文章 URL
 
@@ -226,7 +226,8 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     output_dir = settings.get("output_dir", "output")
 
     os.makedirs(output_dir, exist_ok=True)
-    safe_name = nickname.replace("/", "_").replace(" ", "_")
+    safe_name_source = output_name or nickname
+    safe_name = safe_name_source.replace("/", "_").replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_output_dir = os.path.join(output_dir, f"{safe_name}_{timestamp}")
     os.makedirs(run_output_dir, exist_ok=True)
@@ -541,6 +542,13 @@ def main():
         help="只抓取 config 中的第 N 个目标 (从 0 开始)",
     )
     parser.add_argument(
+        "--alias",
+        "-a",
+        type=str,
+        default=None,
+        help="按 config 中的短别名抓取目标，例如 by",
+    )
+    parser.add_argument(
         "--max",
         type=int,
         default=None,
@@ -660,6 +668,20 @@ def main():
     # 命令行指定的 nickname/fakeid 优先
     if args.nickname or args.fakeid or args.biz:
         targets = [{"nickname": args.nickname or "未知", "fakeid": args.fakeid or args.biz}]
+    elif args.alias:
+        matched_targets = [
+            target for target in targets
+            if args.alias in {
+                str(target.get("alias", "")),
+                str(target.get("output_name", "")),
+                str(target.get("name", "")),
+            }
+        ]
+        if not matched_targets:
+            print(f"[✗] 未找到别名: {args.alias}")
+            print("    请在 config.json 的 targets 里配置 alias，例如: {\"nickname\":\"公众号名\", \"alias\":\"by\"}")
+            sys.exit(1)
+        targets = matched_targets
     elif args.target is not None:
         targets = [targets[args.target]]
 
@@ -701,6 +723,7 @@ def main():
             fakeid=target.get("fakeid"),
             max_articles=args.max_articles,
             since_date=since_date,
+            output_name=target.get("output_name") or target.get("alias"),
         )
 
 

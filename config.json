@@ -1,7 +1,9 @@
 {
   "targets": [
     {
-      "nickname": "宝医社区健康管理"
+      "nickname": "宝医社区健康管理",
+      "alias": "by",
+      "output_name": "by"
     }
   ],
   "crawl_settings": {

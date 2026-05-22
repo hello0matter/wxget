@@ -24,6 +24,12 @@ playwright install chromium
 # 获取默认数量的文章
 python crawler.py --nickname "数字生命卡兹克"
 
+# 用 config.json 里的短别名抓取，少打长名称
+python crawler.py -a by
+
+# config.json 只有一个目标时，也可以直接运行
+python crawler.py
+
 # 仅获取最新的 10 篇文章
 python crawler.py --nickname "数字生命卡兹克" --max 10
 
@@ -70,6 +76,28 @@ python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 32 --pro
 ```
 
 代理池会按文章序号轮询分配；如果失败率过高，默认会自动降并发，避免整批请求连续失败。
+
+### 短别名与短输出目录
+
+`config.json` 的目标支持短别名：
+```json
+{
+  "targets": [
+    {
+      "nickname": "宝医社区健康管理",
+      "alias": "by",
+      "output_name": "by"
+    }
+  ]
+}
+```
+
+之后可以直接运行：
+```bash
+python crawler.py -a by
+```
+
+输出目录也会变短，例如 `output/by_20260522_120000/`。
 
 ### 3. 获取登录凭证 (核心步骤)
 

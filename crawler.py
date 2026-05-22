@@ -12,6 +12,7 @@ import time
 import os
 import sys
 import argparse
+from pathlib import Path
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -292,6 +293,77 @@ def has_reusable_list_checkpoint(target, settings, max_articles=None):
     return bool(max_articles and len(checkpoint.get("articles", [])) >= max_articles)
 
 
+def list_task_dirs(output_dir="output"):
+    if not os.path.isdir(output_dir):
+        return []
+    rows = []
+    for path in Path(output_dir).iterdir():
+        if not path.is_dir():
+            continue
+        list_file = path / "article_list.json"
+        full_file = path / "article_full.json"
+        if not list_file.exists() and not full_file.exists():
+            continue
+        list_data = load_json_file(str(list_file)) if list_file.exists() else {}
+        full_data = load_json_file(str(full_file)) if full_file.exists() else {}
+        articles = []
+        if isinstance(full_data, dict) and full_data.get("articles"):
+            articles = full_data.get("articles", [])
+        elif isinstance(list_data, dict) and list_data.get("articles"):
+            articles = list_data.get("articles", [])
+        rows.append(
+            {
+                "path": path,
+                "name": path.name,
+                "mtime": path.stat().st_mtime,
+                "account": (full_data or list_data or {}).get("account", ""),
+                "list_status": (list_data or {}).get("status", "missing") if list_file.exists() else "missing",
+                "full_status": (full_data or {}).get("status", "missing") if full_file.exists() else "missing",
+                "articles": len(articles),
+                "has_report": (path / "分析报告.md").exists(),
+            }
+        )
+    return sorted(rows, key=lambda item: item["mtime"], reverse=True)
+
+
+def choose_task_dir(output_dir="output"):
+    rows = list_task_dirs(output_dir)
+    if not rows:
+        print(f"[!] 没有发现任务目录: {output_dir}")
+        return None
+
+    print("\n可用历史任务：")
+    for index, item in enumerate(rows[:20], 1):
+        report_label = "有报告" if item["has_report"] else "无报告"
+        print(
+            f"  {index}. {item['name']} | {item['articles']}篇 | "
+            f"列表:{item['list_status']} 正文:{item['full_status']} | {report_label}"
+        )
+
+    while True:
+        value = input("选择任务编号（回车=1，q=返回）：").strip().lower()
+        if not value:
+            return rows[0]["path"]
+        if value == "q":
+            return None
+        if value.isdigit() and 1 <= int(value) <= min(len(rows), 20):
+            return rows[int(value) - 1]["path"]
+        print("请输入有效编号。")
+
+
+def run_report_for_task(task_dir, settings):
+    task_dir = Path(task_dir)
+    full_file = task_dir / "article_full.json"
+    list_file = task_dir / "article_list.json"
+    source_file = full_file if full_file.exists() else list_file
+    data = load_json_file(str(source_file))
+    if not isinstance(data, dict) or not data.get("articles"):
+        print(f"[x] 任务没有可分析的文章: {task_dir}")
+        return None
+    nickname = data.get("account") or task_dir.name
+    return run_analysis_report(nickname, str(source_file), data.get("articles", []), str(task_dir), settings)
+
+
 def build_article_list_result(nickname, articles, status, articles_sum=None, next_begin=None):
     """构造列表阶段结果，供 checkpoint 与最终输出复用。"""
     return {
@@ -332,7 +404,7 @@ def filter_pending_content_articles(all_articles, existing_results):
 
 
 def run_analysis_report(nickname, full_output_file, articles, report_dir, settings):
-    """爬取完成后自动生成 analyze_output 同款资产报告。"""
+    """爬取完成后自动生成资产分析报告。"""
     if not settings.get("analyze_after_crawl", True):
         return None
     if settings.get("analysis_skip_existing", True):
@@ -340,6 +412,8 @@ def run_analysis_report(nickname, full_output_file, articles, report_dir, settin
             os.path.join(report_dir, "分析报告.md"),
             os.path.join(report_dir, "非微信网络资产.txt"),
             os.path.join(report_dir, "图片资源", "本地图片清单.txt"),
+            os.path.join(report_dir, "图片资源", "疑似二维码小程序码图片.txt"),
+            os.path.join(report_dir, "图片资源", "标准二维码解码结果.txt"),
         ]
         if all(os.path.exists(path) for path in required_report_files):
             print(f"✅ 分析报告已存在，跳过第三阶段: {report_dir}")
@@ -746,6 +820,180 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     return all_articles
 
 
+def apply_cli_overrides(args, settings):
+    if args.fast:
+        settings["content_workers"] = max(16, int(settings.get("content_workers", 16) or 16))
+        settings.setdefault("content_delay_seconds", 0)
+        settings.setdefault("delay_seconds", 1)
+    if args.content_workers is not None:
+        settings["content_workers"] = args.content_workers
+    if args.content_proxy is not None:
+        settings["content_proxies"] = args.content_proxy
+    if args.content_proxy_file is not None:
+        settings["content_proxy_file"] = args.content_proxy_file
+    if args.content_delay is not None:
+        settings["content_delay_seconds"] = args.content_delay
+    if args.list_delay is not None:
+        settings["delay_seconds"] = args.list_delay
+    if args.cooldown is not None:
+        settings["list_freq_cooldown_seconds"] = args.cooldown
+    if args.skip_analysis:
+        settings["analyze_after_crawl"] = False
+    if args.analysis_workers is not None:
+        settings["analysis_workers"] = args.analysis_workers
+    if args.new_run or args.no_resume:
+        settings["new_run"] = True
+        settings["resume"] = False
+    return settings
+
+
+def select_targets(args, config):
+    targets = config.get("targets", [])
+    if args.nickname or args.fakeid or args.biz:
+        return [{"nickname": args.nickname or "未知", "fakeid": args.fakeid or args.biz}]
+    if args.alias:
+        matched_targets = [
+            target for target in targets
+            if args.alias in {
+                str(target.get("alias", "")),
+                str(target.get("output_name", "")),
+                str(target.get("name", "")),
+            }
+        ]
+        if not matched_targets:
+            print(f"[✗] 未找到别名: {args.alias}")
+            print("    请在 config.json 的 targets 里配置 alias，例如: {\"nickname\":\"公众号名\", \"alias\":\"by\"}")
+            sys.exit(1)
+        return matched_targets
+    if args.target is not None:
+        return [targets[args.target]]
+    return targets
+
+
+def parse_since_date(since):
+    if not since:
+        return None
+    try:
+        since_date = datetime.strptime(since, "%Y-%m-%d")
+        print(f"📅 时间过滤: 只抓取 {since} 之后的文章")
+        return since_date
+    except ValueError:
+        print(f"[✗] 日期格式错误: {since}，请使用 YYYY-MM-DD 格式")
+        sys.exit(1)
+
+
+def get_runtime_credentials(args, targets, settings):
+    needs_credentials = bool(args.relogin or args.credentials)
+    if not needs_credentials:
+        needs_credentials = any(
+            not has_reusable_list_checkpoint(target, settings, args.max_articles)
+            for target in targets
+        )
+
+    if not needs_credentials:
+        print("↩️  检测到完整列表 checkpoint，本次续跑无需登录凭证")
+        return None, None
+    if args.credentials:
+        data = json.loads(args.credentials)
+        cookie, token = data["cookie"], data["token"]
+        save_credentials(cookie, token)
+        return cookie, token
+    if args.relogin:
+        return get_credentials_auto(headless=args.headless)
+
+    cookie, token = load_credentials()
+    if not cookie or not token:
+        cookie, token = get_credentials_smart(headless=args.headless)
+    return cookie, token
+
+
+def run_crawl_with_args(args, config, settings):
+    targets = select_targets(args, config)
+    if not targets:
+        print("[✗] 未指定目标公众号")
+        print("    用法: python crawler.py --nickname 公众号名称")
+        print("    或者在 config.json 中配置 targets")
+        return 1
+
+    if not (args.nickname or args.fakeid or args.biz or args.alias or args.target is not None) and len(targets) == 1:
+        target = targets[0]
+        alias_label = target.get("alias") or target.get("output_name")
+        if alias_label:
+            print(f"ℹ️  使用 config.json 默认目标：{target['nickname']}（等同于 -a {alias_label}）")
+        else:
+            print(f"ℹ️  使用 config.json 默认目标：{target['nickname']}")
+
+    since_date = parse_since_date(args.since)
+    cookie, token = get_runtime_credentials(args, targets, settings)
+
+    for target in targets:
+        crawl_account(
+            cookie=cookie,
+            token=token,
+            nickname=target["nickname"],
+            settings=settings,
+            fakeid=target.get("fakeid"),
+            max_articles=args.max_articles,
+            since_date=since_date,
+            output_name=target.get("output_name") or target.get("alias"),
+        )
+    return 0
+
+
+def interactive_menu(args, config, settings):
+    targets = config.get("targets", [])
+    default_target = targets[0] if targets else {}
+    alias_label = default_target.get("alias") or default_target.get("output_name") or "默认目标"
+    output_dir = settings.get("output_dir", "output")
+
+    while True:
+        print("\n请选择操作：")
+        print(f"  1. 继续上次任务 / 默认抓取（{alias_label}，自动断点续跑）")
+        print("  2. 重新开始一个新任务")
+        print("  3. 只读取历史任务并生成/补全分析报告")
+        print("  4. 查看历史任务目录")
+        print("  5. 查看帮助")
+        print("  0. 退出")
+        choice = input("输入编号（回车=1）：").strip()
+        if not choice:
+            choice = "1"
+
+        if choice == "0":
+            return 0
+        if choice == "1":
+            args.new_run = False
+            args.no_resume = False
+            return run_crawl_with_args(args, config, settings)
+        if choice == "2":
+            args.new_run = True
+            args.no_resume = True
+            settings["new_run"] = True
+            settings["resume"] = False
+            return run_crawl_with_args(args, config, settings)
+        if choice == "3":
+            task_dir = choose_task_dir(output_dir)
+            if task_dir:
+                settings["analysis_skip_existing"] = False
+                run_report_for_task(task_dir, settings)
+            continue
+        if choice == "4":
+            rows = list_task_dirs(output_dir)
+            if not rows:
+                print(f"[!] 没有发现任务目录: {output_dir}")
+            else:
+                for index, item in enumerate(rows[:20], 1):
+                    report_label = "有报告" if item["has_report"] else "无报告"
+                    print(
+                        f"  {index}. {item['name']} | {item['articles']}篇 | "
+                        f"列表:{item['list_status']} 正文:{item['full_status']} | {report_label}"
+                    )
+            continue
+        if choice == "5":
+            print("运行 python .\\crawler.py --help 查看完整参数说明。")
+            continue
+        print("请输入 0-5 之间的编号。")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="crawler.py",
@@ -756,7 +1004,7 @@ def main():
         epilog=(
             "常用示例：\n"
             "  python .\\crawler.py\n"
-            "      使用 config.json 默认目标，当前等同于 python .\\crawler.py -a by\n\n"
+            "      进入交互菜单，可选择继续上次、重新抓、只分析历史任务\n\n"
             "  python .\\crawler.py -a by\n"
             "      使用短别名 by 抓取，默认自动续跑旧进度\n\n"
             "  python .\\crawler.py -a by --max 20\n"
@@ -766,7 +1014,7 @@ def main():
             "  python .\\crawler.py -a by --new-run\n"
             "      不复用旧进度，重新开一个输出目录\n\n"
             "输出目录：\n"
-            "  output/by_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/ 等。"
+            "  output/by_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt 等。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,
@@ -915,114 +1163,42 @@ def main():
         action="store_true",
         help="关闭自动续跑，等同于 --new-run",
     )
+    parser.add_argument(
+        "--menu",
+        action="store_true",
+        help="强制进入交互菜单",
+    )
+    parser.add_argument(
+        "--no-menu",
+        action="store_true",
+        help="不进入菜单，直接按参数执行；适合脚本/定时任务",
+    )
     args = parser.parse_args()
 
     # 加载配置
     config = load_config(args.config)
     settings = config.get("crawl_settings", {})
-    if args.fast:
-        settings["content_workers"] = max(16, int(settings.get("content_workers", 16) or 16))
-        settings.setdefault("content_delay_seconds", 0)
-        settings.setdefault("delay_seconds", 1)
-    if args.content_workers is not None:
-        settings["content_workers"] = args.content_workers
-    if args.content_proxy is not None:
-        settings["content_proxies"] = args.content_proxy
-    if args.content_proxy_file is not None:
-        settings["content_proxy_file"] = args.content_proxy_file
-    if args.content_delay is not None:
-        settings["content_delay_seconds"] = args.content_delay
-    if args.list_delay is not None:
-        settings["delay_seconds"] = args.list_delay
-    if args.cooldown is not None:
-        settings["list_freq_cooldown_seconds"] = args.cooldown
-    if args.skip_analysis:
-        settings["analyze_after_crawl"] = False
-    if args.analysis_workers is not None:
-        settings["analysis_workers"] = args.analysis_workers
-    if args.new_run or args.no_resume:
-        settings["new_run"] = True
-        settings["resume"] = False
-    targets = config.get("targets", [])
+    settings = apply_cli_overrides(args, settings)
 
-    # 命令行指定的 nickname/fakeid 优先
-    if args.nickname or args.fakeid or args.biz:
-        targets = [{"nickname": args.nickname or "未知", "fakeid": args.fakeid or args.biz}]
-    elif args.alias:
-        matched_targets = [
-            target for target in targets
-            if args.alias in {
-                str(target.get("alias", "")),
-                str(target.get("output_name", "")),
-                str(target.get("name", "")),
-            }
+    has_direct_args = any(
+        [
+            args.nickname,
+            args.fakeid,
+            args.biz,
+            args.alias,
+            args.target is not None,
+            args.max_articles is not None,
+            args.since,
+            args.relogin,
+            args.credentials,
+            args.new_run,
+            args.no_resume,
+            args.no_menu,
         ]
-        if not matched_targets:
-            print(f"[✗] 未找到别名: {args.alias}")
-            print("    请在 config.json 的 targets 里配置 alias，例如: {\"nickname\":\"公众号名\", \"alias\":\"by\"}")
-            sys.exit(1)
-        targets = matched_targets
-    elif args.target is not None:
-        targets = [targets[args.target]]
-
-    if not targets:
-        print("[✗] 未指定目标公众号")
-        print("    用法: python crawler.py --nickname 公众号名称")
-        print("    或者在 config.json 中配置 targets")
-        sys.exit(1)
-
-    if not (args.nickname or args.fakeid or args.biz or args.alias or args.target is not None) and len(targets) == 1:
-        target = targets[0]
-        alias_label = target.get("alias") or target.get("output_name")
-        if alias_label:
-            print(f"ℹ️  未输入目标参数，使用 config.json 默认目标：{target['nickname']}（等同于 -a {alias_label}）")
-        else:
-            print(f"ℹ️  未输入目标参数，使用 config.json 默认目标：{target['nickname']}")
-
-    # 解析 since 日期
-    since_date = None
-    if args.since:
-        try:
-            since_date = datetime.strptime(args.since, "%Y-%m-%d")
-            print(f"📅 时间过滤: 只抓取 {args.since} 之后的文章")
-        except ValueError:
-            print(f"[✗] 日期格式错误: {args.since}，请使用 YYYY-MM-DD 格式")
-            sys.exit(1)
-
-    needs_credentials = bool(args.relogin or args.credentials)
-    if not needs_credentials:
-        needs_credentials = any(
-            not has_reusable_list_checkpoint(target, settings, args.max_articles)
-            for target in targets
-        )
-
-    # 获取凭证；如果只是基于完整 checkpoint 补正文/报告，则不需要登录态
-    if not needs_credentials:
-        cookie, token = None, None
-        print("↩️  检测到完整列表 checkpoint，本次续跑无需登录凭证")
-    elif args.credentials:
-        data = json.loads(args.credentials)
-        cookie, token = data["cookie"], data["token"]
-        save_credentials(cookie, token)
-    elif args.relogin:
-        cookie, token = get_credentials_auto(headless=args.headless)
-    else:
-        cookie, token = load_credentials()
-        if not cookie or not token:
-            cookie, token = get_credentials_smart(headless=args.headless)
-
-    # 抓取
-    for target in targets:
-        crawl_account(
-            cookie=cookie,
-            token=token,
-            nickname=target["nickname"],
-            settings=settings,
-            fakeid=target.get("fakeid"),
-            max_articles=args.max_articles,
-            since_date=since_date,
-            output_name=target.get("output_name") or target.get("alias"),
-        )
+    )
+    if args.menu or (not args.no_menu and not has_direct_args):
+        return interactive_menu(args, config, settings)
+    return run_crawl_with_args(args, config, settings)
 
 
 if __name__ == "__main__":

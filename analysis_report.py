@@ -61,6 +61,17 @@ IMAGE_EXT_BY_CONTENT_TYPE = {
     "image/bmp": ".bmp",
     "image/svg+xml": ".svg",
 }
+QR_HINT_KEYWORDS = (
+    "二维码",
+    "小程序码",
+    "小程序",
+    "扫码",
+    "识别",
+    "长按",
+    "weapp",
+    "qrcode",
+    "qr",
+)
 MINIPROGRAM_HINTS = (
     "weapp",
     "miniprogram",
@@ -606,6 +617,109 @@ def download_image_assets(images, image_dir, timeout=20, max_images=None):
     return rows
 
 
+def score_qr_candidate(item):
+    text = " ".join(
+        str(item.get(key, ""))
+        for key in ("resource_value", "article_title", "article_url", "host", "context", "local_file")
+    ).lower()
+    score = 0
+    reasons = []
+    for keyword in QR_HINT_KEYWORDS:
+        if keyword.lower() in text:
+            score += 3
+            reasons.append(f"关键词:{keyword}")
+    host = item.get("host", "")
+    if is_wechat_host(host):
+        score += 1
+        reasons.append("微信图片域名")
+    local_file = item.get("local_file", "")
+    if local_file:
+        name = Path(local_file).name.lower()
+        if any(keyword.lower() in name for keyword in QR_HINT_KEYWORDS):
+            score += 3
+            reasons.append("文件名疑似二维码")
+    return score, reasons
+
+
+def collect_qr_image_candidates(images, downloaded_images):
+    by_url = {item.get("resource_value"): dict(item) for item in images}
+    candidates = []
+    for downloaded in downloaded_images:
+        url = downloaded.get("resource_value")
+        item = by_url.get(url, {}).copy()
+        item.update(downloaded)
+        score, reasons = score_qr_candidate(item)
+        if score <= 0:
+            continue
+        item["qr_score"] = score
+        item["qr_reasons"] = "、".join(reasons)
+        candidates.append(item)
+    return sorted(candidates, key=lambda item: item.get("qr_score", 0), reverse=True)
+
+
+def decode_standard_qr_images(qr_candidates, image_dir):
+    try:
+        import cv2
+    except ImportError:
+        return [], "未安装 opencv-python，跳过标准二维码自动解码；可执行 pip install opencv-python 后重跑分析。"
+
+    detector = cv2.QRCodeDetector()
+    decoded_rows = []
+    for item in qr_candidates:
+        local_file = item.get("local_file")
+        if not local_file:
+            continue
+        image_path = image_dir.parent / local_file
+        if not image_path.exists():
+            continue
+        try:
+            image = cv2.imread(str(image_path))
+            if image is None:
+                continue
+            decoded_text, points, _ = detector.detectAndDecode(image)
+            if decoded_text:
+                decoded = dict(item)
+                decoded["decoded_text"] = decoded_text
+                decoded_rows.append(decoded)
+        except Exception:
+            continue
+    return decoded_rows, ""
+
+
+def write_qr_candidates_text(path, rows):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write("疑似二维码/小程序码图片清单\n")
+        fp.write("=" * 80 + "\n\n")
+        fp.write("说明：这是基于 URL、文件名、文章标题、上下文关键词的线索清单，方便人工查看；图片内隐藏链接不一定能直接解析。\n\n")
+        if not rows:
+            fp.write("未发现明显疑似项。建议仍按缩略图人工检查 `本地图片/`。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"[{index}] 分数：{item.get('qr_score', 0)}\n")
+            fp.write(f"原因：{item.get('qr_reasons', '')}\n")
+            fp.write(f"本地文件：{item.get('local_file', '')}\n")
+            fp.write(f"原始URL：{item.get('resource_value', '')}\n")
+            fp.write(f"来源文章：{item.get('article_title', '')}\n")
+            fp.write(f"文章URL：{item.get('article_url', '')}\n\n")
+
+
+def write_qr_decode_text(path, rows, note=""):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write("标准二维码解码结果\n")
+        fp.write("=" * 80 + "\n\n")
+        if note:
+            fp.write(note + "\n\n")
+        fp.write("说明：微信小程序码通常不是标准 QR，可能无法被通用二维码解码器解析。\n\n")
+        if not rows:
+            fp.write("未解码出标准二维码内容。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"[{index}] {item.get('decoded_text', '')}\n")
+            fp.write(f"本地文件：{item.get('local_file', '')}\n")
+            fp.write(f"原始URL：{item.get('resource_value', '')}\n")
+            fp.write(f"来源文章：{item.get('article_title', '')}\n\n")
+
+
 def write_downloaded_images_text(path, rows):
     with open(path, "w", encoding="utf-8") as fp:
         fp.write("本地图片下载清单\n")
@@ -678,6 +792,8 @@ def save_reports(
             timeout=image_download_timeout,
             max_images=image_download_max,
         )
+    qr_candidates = collect_qr_image_candidates(images, downloaded_images)
+    decoded_qr, decoded_qr_note = decode_standard_qr_images(qr_candidates, image_dir)
 
     type_counts = {}
     host_counts = {}
@@ -698,6 +814,8 @@ def save_reports(
         "images": len(images),
         "downloaded_images": sum(1 for item in downloaded_images if item.get("status") == "ok"),
         "failed_image_downloads": sum(1 for item in downloaded_images if item.get("status") == "error"),
+        "qr_image_candidates": len(qr_candidates),
+        "decoded_standard_qr": len(decoded_qr),
         "errors": sum(1 for item in details if item.get("fetch_status") == "error"),
     }
 
@@ -715,6 +833,8 @@ def save_reports(
         fp.write(f"- 图片资源：{summary['images']}\n\n")
         fp.write(f"- 本地图片下载成功：{summary['downloaded_images']}\n")
         fp.write(f"- 本地图片下载失败：{summary['failed_image_downloads']}\n\n")
+        fp.write(f"- 疑似二维码/小程序码图片：{summary['qr_image_candidates']}\n\n")
+        fp.write(f"- 自动解码标准二维码：{summary['decoded_standard_qr']}\n\n")
 
         fp.write("## 资源类型统计\n\n")
         if type_counts:
@@ -760,6 +880,8 @@ def save_reports(
 
     write_asset_text(image_dir / "图片资源清单.txt", images, "图片资源清单")
     write_downloaded_images_text(image_dir / "本地图片清单.txt", downloaded_images)
+    write_qr_candidates_text(image_dir / "疑似二维码小程序码图片.txt", qr_candidates)
+    write_qr_decode_text(image_dir / "标准二维码解码结果.txt", decoded_qr, decoded_qr_note)
     write_asset_text(asset_dir / "全部资产清单.txt", assets, "全部资产清单")
     write_asset_text(asset_dir / "非微信网络资产清单.txt", external_network, "非微信网络资产清单")
 
@@ -789,6 +911,8 @@ def save_reports(
         write_json(report_dir / "原始资源.json", assets)
         write_json(report_dir / "原始日志.json", logs)
         write_json(report_dir / "本地图片下载.json", downloaded_images)
+        write_json(report_dir / "疑似二维码小程序码图片.json", qr_candidates)
+        write_json(report_dir / "标准二维码解码结果.json", decoded_qr)
 
     return summary
 

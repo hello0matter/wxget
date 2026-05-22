@@ -747,7 +747,32 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
 
 
 def main():
-    parser = argparse.ArgumentParser(description="微信公众号文章爬虫")
+    parser = argparse.ArgumentParser(
+        prog="crawler.py",
+        description=(
+            "微信公众号文章爬虫：抓文章列表、抓正文、下载图片、生成资产分析报告。\n"
+            "不输入任何目标参数时，会使用 config.json 中的默认目标；当前等同于 -a by。"
+        ),
+        epilog=(
+            "常用示例：\n"
+            "  python .\\crawler.py\n"
+            "      使用 config.json 默认目标，当前等同于 python .\\crawler.py -a by\n\n"
+            "  python .\\crawler.py -a by\n"
+            "      使用短别名 by 抓取，默认自动续跑旧进度\n\n"
+            "  python .\\crawler.py -a by --max 20\n"
+            "      只处理最新 20 篇\n\n"
+            "  python .\\crawler.py -a by --workers 32 --proxy-file proxies.txt\n"
+            "      32 线程并使用代理池\n\n"
+            "  python .\\crawler.py -a by --new-run\n"
+            "      不复用旧进度，重新开一个输出目录\n\n"
+            "输出目录：\n"
+            "  output/by_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/ 等。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+    )
+    parser._optionals.title = "选项"
+    parser.add_argument("-h", "--help", action="help", help="显示此帮助信息并退出")
     parser.add_argument(
         "--credentials",
         type=str,
@@ -945,6 +970,14 @@ def main():
         print("    用法: python crawler.py --nickname 公众号名称")
         print("    或者在 config.json 中配置 targets")
         sys.exit(1)
+
+    if not (args.nickname or args.fakeid or args.biz or args.alias or args.target is not None) and len(targets) == 1:
+        target = targets[0]
+        alias_label = target.get("alias") or target.get("output_name")
+        if alias_label:
+            print(f"ℹ️  未输入目标参数，使用 config.json 默认目标：{target['nickname']}（等同于 -a {alias_label}）")
+        else:
+            print(f"ℹ️  未输入目标参数，使用 config.json 默认目标：{target['nickname']}")
 
     # 解析 since 日期
     since_date = None

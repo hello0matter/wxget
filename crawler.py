@@ -423,6 +423,28 @@ def merge_content_results(all_articles, existing_results, fetched_results):
     return merged
 
 
+def merge_pending_content_results(all_articles, existing_results, pending_articles, fetched_results):
+    existing_by_url = {article_url_value(item): item for item in existing_results if article_url_value(item)}
+    fetched_by_url = {}
+    for article, result in zip(pending_articles, fetched_results):
+        merged_result = dict(result)
+        source_url = article_url_value(article)
+        if source_url:
+            merged_result.setdefault("source_url", source_url)
+            if not merged_result.get("url") or "mp.weixin.qq.com/s" not in str(merged_result.get("url")):
+                merged_result["url"] = source_url
+        merged_result.setdefault("original_title", article.get("title", ""))
+        fetched_by_url[source_url] = merged_result
+
+    merged = []
+    for article in all_articles:
+        key = article_url_value(article)
+        item = existing_by_url.get(key) or fetched_by_url.get(key)
+        if item:
+            merged.append(item)
+    return merged
+
+
 def filter_pending_content_articles(all_articles, existing_results):
     existing_by_url = {
         article_url_value(item): item
@@ -828,7 +850,7 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
                     timeout=settings.get("content_timeout", 20),
                     max_retries=settings.get("content_max_retries", 3),
                     progress_callback=lambda partial: save_content_checkpoint(
-                        merge_content_results(all_articles, existing_content_results, partial),
+                        merge_pending_content_results(all_articles, existing_content_results, pending_articles, partial),
                         status="in_progress",
                     ),
                     workers=settings.get("content_workers", 16),
@@ -838,7 +860,10 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
                     error_threshold=settings.get("content_error_threshold", 0.5),
                     min_workers=settings.get("content_min_workers", 1),
                 )
-                results = merge_content_results(all_articles, existing_content_results, fetched_results)
+                results = merge_pending_content_results(all_articles, existing_content_results, pending_articles, fetched_results)
+                if not results and fetched_results:
+                    print("[!] 结果合并为空，已回退为本次抓取结果，避免生成空报告")
+                    results = fetched_results
             except KeyboardInterrupt:
                 print(f"\n[!] 已停止正文抓取，保留当前 checkpoint: {full_output_file}")
                 return all_articles

@@ -12,11 +12,14 @@ import time
 import os
 import sys
 import argparse
+import warnings
 from pathlib import Path
 from datetime import datetime
 from types import SimpleNamespace
 
 from fetch_content import fetch_all_content
+
+warnings.filterwarnings("ignore", message="urllib3 .* doesn't match a supported version.*")
 
 try:
     from wechatarticles import PublicAccountsWeb
@@ -116,6 +119,26 @@ def is_freq_control_error(error):
     """判断是否为微信后台接口频控。"""
     text = str(error).lower()
     return "ret=200013" in text or "freq control" in text
+
+
+def is_credential_error(error):
+    """判断是否为 Cookie/Token 失效或权限异常。"""
+    text = str(error).lower()
+    keywords = (
+        "cookie",
+        "token",
+        "登录",
+        "登陆",
+        "重新输入",
+        "invalid",
+        "unauthorized",
+        "forbidden",
+        "ret=200003",
+        "ret=200004",
+        "ret=200005",
+        "ret=200023",
+    )
+    return any(keyword in text for keyword in keywords)
 
 
 def save_json_atomic(path, data):
@@ -549,6 +572,9 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
                     return []
             except Exception as e:
                 print(f"[✗] 查询公众号失败: {e}")
+                if is_credential_error(e):
+                    print("[!] Cookie/Token 可能已过期，将尝试重新登录")
+                    return {"status": "credential_expired", "message": str(e)}
                 print("[!] 可能是 cookie/token 已过期，请重新提取")
                 return []
 
@@ -575,6 +601,8 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
                     print("[!] 这是微信频控，不是凭证过期；建议等 5~30 分钟后再试")
                 else:
                     print("[!] 可能是 cookie/token 已过期，请重新提取")
+                if is_credential_error(e):
+                    return {"status": "credential_expired", "message": str(e)}
                 return []
 
         first_page_articles = first_page_data.get("app_msg_list", [])
@@ -918,6 +946,10 @@ def get_runtime_credentials(args, targets, settings):
     return cookie, token
 
 
+def should_auto_relogin(args, cookie, token):
+    return bool(cookie and token and not args.credentials)
+
+
 def run_crawl_with_args(args, config, settings):
     targets = select_targets(args, config)
     if not targets:
@@ -937,17 +969,28 @@ def run_crawl_with_args(args, config, settings):
     since_date = parse_since_date(args.since)
     cookie, token = get_runtime_credentials(args, targets, settings)
 
+    retried_login = False
     for target in targets:
-        crawl_account(
-            cookie=cookie,
-            token=token,
-            nickname=target["nickname"],
-            settings=settings,
-            fakeid=target.get("fakeid"),
-            max_articles=args.max_articles,
-            since_date=since_date,
-            output_name=target.get("output_name") or target.get("alias"),
-        )
+        while True:
+            result = crawl_account(
+                cookie=cookie,
+                token=token,
+                nickname=target["nickname"],
+                settings=settings,
+                fakeid=target.get("fakeid"),
+                max_articles=args.max_articles,
+                since_date=since_date,
+                output_name=target.get("output_name") or target.get("alias"),
+            )
+            if not (isinstance(result, dict) and result.get("status") == "credential_expired"):
+                break
+            if retried_login or not should_auto_relogin(args, cookie, token):
+                print("[✗] 自动重新登录后仍失败，请手动检查公众号名称或网络环境")
+                break
+            retried_login = True
+            print("\n🔐 登录态已失效，自动打开浏览器重新扫码获取 Cookie/Token...")
+            cookie, token = get_credentials_auto(headless=args.headless)
+            print("🔁 新凭证已保存，正在自动重试当前任务...")
     return 0
 
 
@@ -1023,7 +1066,7 @@ def main():
             "  python .\\crawler.py -a by --workers 32 --proxy-file proxies.txt\n"
             "      32 线程并使用代理池\n\n"
             "  python .\\crawler.py -a by --new-run\n"
-            "      不复用旧进度，重新开一个输出目录\n\n"
+            "      不复用旧进度，重新开一个输出目录；若凭证过期会自动打开浏览器重新扫码\n\n"
             "输出目录：\n"
             "  output/公众号名_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt 等。"
         ),
@@ -1096,7 +1139,7 @@ def main():
         "--relogin",
         "-r",
         action="store_true",
-        help="忽略已保存凭证，直接启动浏览器重新扫码登录",
+        help="忽略已保存凭证，直接启动浏览器重新扫码登录；普通运行遇到凭证过期也会自动触发",
     )
     parser.add_argument(
         "--content-workers",

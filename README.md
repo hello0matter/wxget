@@ -121,6 +121,8 @@ python crawler.py -a by
 python crawler.py -a by --new-run
 ```
 
+如果已保存的 `credentials.json` 过期，程序会自动打开浏览器重新扫码获取 Cookie/Token，然后重试当前任务；也可以手动加 `--relogin` 强制重新扫码。
+
 ### 3. 获取登录凭证 (核心步骤)
 
 微信公众号文章对全量获取有严格的扫码与 IP 安全限制。**您必须根据当前的运行环境采取不同的策略**：

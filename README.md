@@ -24,6 +24,8 @@ playwright install chromium
 # 进入交互菜单：继续上次、重新抓、只分析历史任务
 python crawler.py
 
+# 菜单中可选“6”，直接输入公众号名称临时抓取，不用改 config.json
+
 # 直接执行，不进菜单
 python crawler.py -a by --no-menu
 
@@ -41,6 +43,9 @@ python crawler.py -a by --new-run
 
 # 仅获取最新的 10 篇文章
 python crawler.py --nickname "数字生命卡兹克" --max 10
+
+# 临时换公众号抓取，不修改 config.json
+python crawler.py --nickname "公众号名称"
 
 # 获取从指定日期以来的所有文章
 python crawler.py --nickname "数字生命卡兹克" --since 2026-03-01

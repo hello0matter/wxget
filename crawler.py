@@ -1032,6 +1032,7 @@ def interactive_menu(args, config, settings):
         print("  3. 只读取历史任务并生成/补全分析报告")
         print("  4. 查看历史任务目录")
         print("  5. 查看帮助")
+        print("  6. 输入公众号名称临时抓取（不用改 config.json）")
         print("  0. 退出")
         choice = input("输入编号（回车=1）：").strip()
         if not choice:
@@ -1070,7 +1071,20 @@ def interactive_menu(args, config, settings):
         if choice == "5":
             print("运行 python .\\crawler.py --help 查看完整参数说明。")
             continue
-        print("请输入 0-5 之间的编号。")
+        if choice == "6":
+            nickname = input("请输入公众号名称（需精确匹配）：").strip()
+            if not nickname:
+                print("[!] 公众号名称不能为空")
+                continue
+            args.nickname = nickname
+            args.alias = None
+            args.target = None
+            args.new_run = False
+            args.no_resume = False
+            settings["new_run"] = False
+            settings["resume"] = True
+            return run_crawl_with_args(args, config, settings)
+        print("请输入 0-6 之间的编号。")
 
 
 def main():
@@ -1086,6 +1100,8 @@ def main():
             "      进入交互菜单，可选择继续上次、重新抓、只分析历史任务\n\n"
             "  python .\\crawler.py -a by\n"
             "      使用短别名 by 抓取，默认自动续跑旧进度\n\n"
+            "  python .\\crawler.py --nickname \"公众号名称\"\n"
+            "      不改 config.json，临时输入公众号名称抓取\n\n"
             "  python .\\crawler.py -a by --max 20\n"
             "      只处理最新 20 篇\n\n"
             "  python .\\crawler.py -a by --workers 32 --proxy-file proxies.txt\n"
@@ -1115,7 +1131,7 @@ def main():
         "--nickname",
         type=str,
         default=None,
-        help="直接指定公众号名称（覆盖 config.json）",
+        help="直接指定公众号名称（覆盖 config.json，不用改配置文件）",
     )
     parser.add_argument(
         "--fakeid",

@@ -191,6 +191,9 @@ def run_analysis_report(nickname, full_output_file, articles, report_dir, settin
         images,
         logs,
         keep_json=settings.get("analysis_keep_json", False),
+        download_images=settings.get("analysis_download_images", True),
+        image_download_timeout=settings.get("analysis_image_download_timeout", 20),
+        image_download_max=settings.get("analysis_image_download_max"),
     )
     print(f"✅ 分析完成: 文章 {summary['articles']} / 资源 {summary['assets']} / 图片 {summary['images']}")
     return summary

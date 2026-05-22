@@ -10,6 +10,7 @@ Default behavior:
 """
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -22,6 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+from curl_cffi import requests as curl_requests
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,6 +43,24 @@ except ImportError as exc:
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'<>，。；；、）)]+", re.I)
 IMAGE_HOSTS = {"mmbiz.qpic.cn", "mmbiz.qlogo.cn", "wx.qlogo.cn"}
+WECHAT_HOST_SUFFIXES = (
+    "mp.weixin.qq.com",
+    "weixin.qq.com",
+    "wx.qq.com",
+    "qq.com",
+    "qpic.cn",
+    "qlogo.cn",
+    "gtimg.cn",
+)
+IMAGE_EXT_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+}
 MINIPROGRAM_HINTS = (
     "weapp",
     "miniprogram",
@@ -62,6 +82,11 @@ def normalize_url(url):
 
 def get_hostname(url):
     return (urlparse(url).hostname or "").lower()
+
+
+def is_wechat_host(host):
+    host = (host or "").lower()
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in WECHAT_HOST_SUFFIXES)
 
 
 def is_http_url(url):
@@ -495,6 +520,114 @@ def unique_network_assets(assets):
     return rows
 
 
+def non_wechat_network_assets(assets):
+    return [item for item in unique_network_assets(assets) if not is_wechat_host(item.get("host"))]
+
+
+def image_file_extension(url, content_type=""):
+    content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if content_type in IMAGE_EXT_BY_CONTENT_TYPE:
+        return IMAGE_EXT_BY_CONTENT_TYPE[content_type]
+
+    path = urlparse(url).path.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"):
+        if path.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    return ".jpg"
+
+
+def download_image_assets(images, image_dir, timeout=20, max_images=None):
+    download_dir = Path(image_dir) / "本地图片"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    session = curl_requests.Session(impersonate="chrome124", timeout=timeout)
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 MicroMessenger/8.0",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+    )
+
+    seen = set()
+    rows = []
+    for item in images:
+        url = item.get("resource_value", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if max_images and len(rows) >= max_images:
+            break
+
+        url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+        title = safe_filename(item.get("article_title") or "image")[:40]
+        row = {
+            "resource_value": url,
+            "article_title": item.get("article_title", ""),
+            "article_url": item.get("article_url", ""),
+            "host": item.get("host", ""),
+            "status": "pending",
+            "local_file": "",
+            "message": "",
+        }
+
+        try:
+            response = session.get(
+                url,
+                headers={
+                    "Referer": item.get("article_url") or "https://mp.weixin.qq.com/",
+                },
+            )
+            content = response.content or b""
+            content_type = response.headers.get("content-type", "")
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            if not content:
+                raise RuntimeError("empty response")
+
+            ext = image_file_extension(url, content_type)
+            local_name = f"{len(rows) + 1:04d}_{title}_{url_hash}{ext}"
+            local_path = download_dir / local_name
+            with open(local_path, "wb") as fp:
+                fp.write(content)
+
+            row.update(
+                {
+                    "status": "ok",
+                    "local_file": str(local_path.relative_to(image_dir.parent)),
+                    "bytes": len(content),
+                    "content_type": content_type,
+                }
+            )
+        except Exception as exc:
+            row.update({"status": "error", "message": str(exc)})
+
+        rows.append(row)
+
+    return rows
+
+
+def write_downloaded_images_text(path, rows):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write("本地图片下载清单\n")
+        fp.write("=" * 80 + "\n\n")
+        if not rows:
+            fp.write("未发现可下载图片。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"[{index}] {item.get('status')}\n")
+            fp.write(f"本地文件：{item.get('local_file', '')}\n")
+            fp.write(f"原始URL：{item.get('resource_value', '')}\n")
+            fp.write(f"来源文章：{item.get('article_title', '')}\n")
+            fp.write(f"文章URL：{item.get('article_url', '')}\n")
+            if item.get("bytes"):
+                fp.write(f"大小：{item.get('bytes')} bytes\n")
+            if item.get("content_type"):
+                fp.write(f"类型：{item.get('content_type')}\n")
+            if item.get("message"):
+                fp.write(f"说明：{item.get('message')}\n")
+            fp.write("\n")
+
+
 def write_asset_text(path, rows, title):
     with open(path, "w", encoding="utf-8") as fp:
         fp.write(title + "\n")
@@ -515,7 +648,19 @@ def write_asset_text(path, rows, title):
             fp.write("\n")
 
 
-def save_reports(report_dir, account, source_file, details, assets, images, logs, keep_json=False):
+def save_reports(
+    report_dir,
+    account,
+    source_file,
+    details,
+    assets,
+    images,
+    logs,
+    keep_json=False,
+    download_images=True,
+    image_download_timeout=20,
+    image_download_max=None,
+):
     report_dir = Path(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     image_dir = report_dir / "图片资源"
@@ -523,6 +668,16 @@ def save_reports(report_dir, account, source_file, details, assets, images, logs
     image_dir.mkdir(exist_ok=True)
     asset_dir.mkdir(exist_ok=True)
     network = unique_network_assets(assets)
+    external_network = non_wechat_network_assets(assets)
+    downloaded_images = []
+    if download_images:
+        print(f"🖼️  下载图片到本地: {image_dir / '本地图片'}")
+        downloaded_images = download_image_assets(
+            images,
+            image_dir,
+            timeout=image_download_timeout,
+            max_images=image_download_max,
+        )
 
     type_counts = {}
     host_counts = {}
@@ -539,7 +694,10 @@ def save_reports(report_dir, account, source_file, details, assets, images, logs
         "success": sum(1 for item in details if item.get("fetch_status") == "ok"),
         "assets": len(assets),
         "unique_network_assets": len(network),
+        "non_wechat_network_assets": len(external_network),
         "images": len(images),
+        "downloaded_images": sum(1 for item in downloaded_images if item.get("status") == "ok"),
+        "failed_image_downloads": sum(1 for item in downloaded_images if item.get("status") == "error"),
         "errors": sum(1 for item in details if item.get("fetch_status") == "error"),
     }
 
@@ -553,7 +711,10 @@ def save_reports(report_dir, account, source_file, details, assets, images, logs
         fp.write(f"- 获取失败：{summary['errors']}\n")
         fp.write(f"- 发现资源总数：{summary['assets']}\n")
         fp.write(f"- 唯一网络资产：{summary['unique_network_assets']}\n")
+        fp.write(f"- 非微信网络资产：{summary['non_wechat_network_assets']}\n")
         fp.write(f"- 图片资源：{summary['images']}\n\n")
+        fp.write(f"- 本地图片下载成功：{summary['downloaded_images']}\n")
+        fp.write(f"- 本地图片下载失败：{summary['failed_image_downloads']}\n\n")
 
         fp.write("## 资源类型统计\n\n")
         if type_counts:
@@ -593,8 +754,14 @@ def save_reports(report_dir, account, source_file, details, assets, images, logs
         for item in network:
             fp.write(item["resource_value"] + "\n")
 
+    with open(report_dir / "非微信网络资产.txt", "w", encoding="utf-8") as fp:
+        for item in external_network:
+            fp.write(item["resource_value"] + "\n")
+
     write_asset_text(image_dir / "图片资源清单.txt", images, "图片资源清单")
+    write_downloaded_images_text(image_dir / "本地图片清单.txt", downloaded_images)
     write_asset_text(asset_dir / "全部资产清单.txt", assets, "全部资产清单")
+    write_asset_text(asset_dir / "非微信网络资产清单.txt", external_network, "非微信网络资产清单")
 
     assets_by_type = {}
     for item in assets:
@@ -621,6 +788,7 @@ def save_reports(report_dir, account, source_file, details, assets, images, logs
         write_json(report_dir / "原始详情.json", details)
         write_json(report_dir / "原始资源.json", assets)
         write_json(report_dir / "原始日志.json", logs)
+        write_json(report_dir / "本地图片下载.json", downloaded_images)
 
     return summary
 

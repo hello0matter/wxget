@@ -18,10 +18,17 @@ ERROR_NO_CONTENT = "no_content"
 
 
 class WechatArticleFetcher:
-    def __init__(self, timeout: int = 20, max_retries: int = 3, retry_delay: float = 1.0) -> None:
+    def __init__(
+        self,
+        timeout: int = 20,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        proxy: str | None = None,
+    ) -> None:
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
         self.retry_delay = max(0.0, retry_delay)
+        self.proxy = proxy
         # 维持会话可以重用 cookies，被当作同一个正常用户的概率更高
         self.session = curl_requests.Session(impersonate="chrome124", timeout=self.timeout)
         self.session.headers.update({
@@ -47,7 +54,13 @@ class WechatArticleFetcher:
 
     def _fetch_html_once(self, url: str) -> tuple[str | None, int | None, str | None]:
         try:
-            response = self.session.get(url)
+            request_kwargs = {}
+            if self.proxy:
+                request_kwargs["proxies"] = {
+                    "http": self.proxy,
+                    "https": self.proxy,
+                }
+            response = self.session.get(url, **request_kwargs)
             return response.text, response.status_code, None
         except Exception as exc:
             return None, None, str(exc)
@@ -142,9 +155,15 @@ def main() -> int:
     cli.add_argument("--timeout", type=int, default=20)
     cli.add_argument("--max-retries", type=int, default=3)
     cli.add_argument("--retry-delay", type=float, default=1.0)
+    cli.add_argument("--proxy", help="文章请求代理，支持 http://、https://、socks5://、socks5h://")
     args = cli.parse_args()
 
-    fetcher = WechatArticleFetcher(timeout=args.timeout, max_retries=args.max_retries, retry_delay=args.retry_delay)
+    fetcher = WechatArticleFetcher(
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+        proxy=args.proxy,
+    )
     fetched = fetcher.fetch(args.url)
     if "error" in fetched:
         print(json.dumps(fetched, ensure_ascii=False, indent=2))

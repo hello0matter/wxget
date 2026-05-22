@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from read_wechat_article import WechatArticleFetcher, WechatArticleParser
@@ -35,7 +36,110 @@ def load_article_list(json_path):
         sys.exit(1)
 
 
-def fetch_all_content(articles, max_articles=None, delay=3, timeout=20, max_retries=3):
+def normalize_proxy(proxy):
+    """标准化代理地址；未写协议时默认按 HTTP 代理处理。"""
+    proxy = str(proxy).strip()
+    if not proxy:
+        return ""
+    if "://" not in proxy:
+        return f"http://{proxy}"
+    return proxy
+
+
+def load_proxy_pool(proxies=None, proxy_file=None):
+    """加载代理池，支持 list、逗号分隔字符串和按行保存的文件。"""
+    proxy_pool = []
+
+    if proxies:
+        if isinstance(proxies, str):
+            proxy_pool.extend(item.strip() for item in proxies.replace(";", ",").split(","))
+        else:
+            for item in proxies:
+                if isinstance(item, str):
+                    proxy_pool.extend(part.strip() for part in item.replace(";", ",").split(","))
+                else:
+                    proxy_pool.append(str(item).strip())
+
+    if proxy_file:
+        with open(proxy_file, "r", encoding="utf-8") as f:
+            for line in f:
+                proxy = line.strip()
+                if proxy and not proxy.startswith("#"):
+                    proxy_pool.extend(item.strip() for item in proxy.replace(";", ",").split(","))
+
+    return [proxy for proxy in (normalize_proxy(item) for item in proxy_pool) if proxy]
+
+
+def pick_proxy(proxy_pool, article_index):
+    """按文章序号轮询代理；返回 None 时表示直连。"""
+    if not proxy_pool:
+        return None
+    return proxy_pool[article_index % len(proxy_pool)]
+
+
+def compact_results(results):
+    """去掉尚未完成的占位项，并保持原始顺序。"""
+    return [result for result in results if result is not None]
+
+
+def fetch_one_article(article, article_index, total, timeout, max_retries, proxy=None):
+    """抓取并解析单篇文章，便于串行和并发复用。"""
+    fetcher = WechatArticleFetcher(timeout=timeout, max_retries=max_retries, proxy=proxy)
+    parser = WechatArticleParser()
+
+    url = article.get("link") or article.get("url") or article.get("content_url")
+    title = article.get("title", "无标题")
+
+    if not url:
+        return article_index, {
+            "title": title,
+            "url": None,
+            "error": "missing_url",
+            "content": None,
+        }, False
+
+    if url.startswith("http://"):
+        url = url.replace("http://", "https://", 1)
+
+    fetched = fetcher.fetch(url)
+
+    if "error" in fetched:
+        return article_index, {
+            "title": title,
+            "url": url,
+            "error": fetched["error"],
+            "message": fetched.get("message", fetched["error"]),
+            "content": None,
+        }, False
+
+    parsed = parser.parse(fetched["page_html"])
+    content = parsed.get("content", "")
+    result = {
+        "title": parsed.get("title") or title,
+        "author": parsed.get("author", ""),
+        "pub_time": parsed.get("pub_time", ""),
+        "url": fetched["source_url"],
+        "content": content,
+        "content_length": len(content),
+    }
+
+    return article_index, result, bool(content)
+
+
+def fetch_all_content(
+    articles,
+    max_articles=None,
+    delay=3,
+    timeout=20,
+    max_retries=3,
+    progress_callback=None,
+    workers=16,
+    proxies=None,
+    proxy_file=None,
+    adaptive=True,
+    error_threshold=0.5,
+    min_workers=1,
+):
     """
     批量抓取文章正文内容
 
@@ -51,77 +155,137 @@ def fetch_all_content(articles, max_articles=None, delay=3, timeout=20, max_retr
         单次 HTTP 请求超时秒数
     max_retries : int
         每篇文章的最大重试次数
+    progress_callback : callable, optional
+        每处理完一篇文章后接收当前结果列表，用于 checkpoint 落盘
+    workers : int
+        正文抓取并发数；列表接口不受此参数影响
+    proxies : list or str, optional
+        代理池，支持 http://、https://、socks5://、socks5h://
+    proxy_file : str, optional
+        按行保存代理的文件路径
+    adaptive : bool
+        错误率过高时是否自动降低并发
+    error_threshold : float
+        单轮失败率达到该值时降低并发
+    min_workers : int
+        自动降低并发时的最小并发数
     """
-    fetcher = WechatArticleFetcher(timeout=timeout, max_retries=max_retries)
-    parser = WechatArticleParser()
-
     if max_articles:
         articles = articles[:max_articles]
 
     total = len(articles)
-    results = []
+    results = [None] * total
     success_count = 0
     fail_count = 0
+    worker_count = max(1, int(workers or 16))
+    min_worker_count = max(1, min(int(min_workers or 1), worker_count))
+    proxy_pool = load_proxy_pool(proxies=proxies, proxy_file=proxy_file)
 
     print(f"\n📖 开始抓取 {total} 篇文章正文...\n")
+    if worker_count > 1:
+        print(f"⚡ 正文并发: {worker_count} 线程")
+    if proxy_pool:
+        print(f"🌐 代理轮询: {len(proxy_pool)} 个代理（支持 HTTP/HTTPS/SOCKS5/SOCKS5H；未写协议默认 http://）")
 
-    for i, article in enumerate(articles):
-        # 获取文章 URL（兼容不同字段名）
-        url = article.get("link") or article.get("url") or article.get("content_url")
-        title = article.get("title", "无标题")
-
-        if not url:
-            print(f"  [{i+1}/{total}] ⚠️ 跳过（无 URL）: {title}")
-            fail_count += 1
-            continue
-
-        # 确保使用 https（crawler 返回的是 http，WeChat 需要 https）
-        if url.startswith("http://"):
-            url = url.replace("http://", "https://", 1)
-
-        print(f"  [{i+1}/{total}] 抓取: {title[:40]}...")
-
-        # 使用 read_wechat_article 的 fetcher 抓取
-        fetched = fetcher.fetch(url)
-
-        if "error" in fetched:
-            print(f"           ❌ 失败: {fetched.get('message', fetched['error'])}")
-            results.append({
-                "title": title,
-                "url": url,
-                "error": fetched["error"],
-                "content": None,
-            })
-            fail_count += 1
-        else:
-            # 解析 HTML 提取正文
-            parsed = parser.parse(fetched["page_html"])
-            content = parsed.get("content", "")
-
-            if content:
-                print(f"           ✅ 成功 ({len(content)} 字)")
+    if worker_count == 1:
+        for article_index, article in enumerate(articles):
+            title = article.get("title", "无标题")
+            print(f"  [{article_index+1}/{total}] 抓取: {title[:40]}...")
+            _, result, ok = fetch_one_article(
+                article,
+                article_index,
+                total,
+                timeout,
+                max_retries,
+                proxy=pick_proxy(proxy_pool, article_index),
+            )
+            results[article_index] = result
+            if ok:
+                print(f"           ✅ 成功 ({result.get('content_length', 0)} 字)")
                 success_count += 1
             else:
-                print(f"           ⚠️ 页面已获取但正文为空")
+                print(f"           ❌ 失败: {result.get('message', result.get('error', 'unknown'))}")
                 fail_count += 1
+            if progress_callback:
+                progress_callback(compact_results(results))
+            if article_index < total - 1:
+                time.sleep(delay)
 
-            results.append({
-                "title": parsed.get("title") or title,
-                "author": parsed.get("author", ""),
-                "pub_time": parsed.get("pub_time", ""),
-                "url": fetched["source_url"],
-                "content": content,
-                "content_length": len(content),
-            })
+        print(f"\n{'='*50}")
+        print(f"✅ 抓取完成: 成功 {success_count} / 失败 {fail_count} / 总计 {total}")
+        return compact_results(results)
 
-        # 控制频率
-        if i < total - 1:
+    remaining_indices = list(range(total))
+    current_workers = worker_count
+
+    while remaining_indices:
+        wave_size = min(len(remaining_indices), current_workers * 2)
+        wave_indices = remaining_indices[:wave_size]
+        remaining_indices = remaining_indices[wave_size:]
+        wave_success_count = 0
+        wave_fail_count = 0
+
+        with ThreadPoolExecutor(max_workers=current_workers) as executor:
+            future_map = {
+                executor.submit(
+                    fetch_one_article,
+                    articles[article_index],
+                    article_index,
+                    total,
+                    timeout,
+                    max_retries,
+                    pick_proxy(proxy_pool, article_index),
+                ): article_index
+                for article_index in wave_indices
+            }
+
+            for future in as_completed(future_map):
+                article_index = future_map[future]
+                title = articles[article_index].get("title", "无标题")
+                try:
+                    _, result, ok = future.result()
+                except Exception as exc:
+                    result = {
+                        "title": title,
+                        "url": articles[article_index].get("link") or articles[article_index].get("url"),
+                        "error": "worker_exception",
+                        "message": str(exc),
+                        "content": None,
+                    }
+                    ok = False
+
+                results[article_index] = result
+                if ok:
+                    success_count += 1
+                    wave_success_count += 1
+                    print(f"  [{article_index+1}/{total}] ✅ {title[:40]}... ({result.get('content_length', 0)} 字)")
+                else:
+                    fail_count += 1
+                    wave_fail_count += 1
+                    print(f"  [{article_index+1}/{total}] ❌ {title[:40]}... {result.get('message', result.get('error', 'unknown'))}")
+
+                if progress_callback:
+                    progress_callback(compact_results(results))
+
+        wave_total = wave_success_count + wave_fail_count
+        if (
+            adaptive
+            and current_workers > min_worker_count
+            and wave_total
+            and wave_fail_count / wave_total >= error_threshold
+        ):
+            new_workers = max(min_worker_count, current_workers // 2)
+            if new_workers < current_workers:
+                print(f"  [!] 本轮失败率 {wave_fail_count}/{wave_total}，并发降到 {new_workers}")
+                current_workers = new_workers
+
+        if remaining_indices and delay:
             time.sleep(delay)
 
     print(f"\n{'='*50}")
     print(f"✅ 抓取完成: 成功 {success_count} / 失败 {fail_count} / 总计 {total}")
 
-    return results
+    return compact_results(results)
 
 
 def main():
@@ -150,6 +314,36 @@ def main():
         help="单次 HTTP 请求超时秒数 (默认: 20)",
     )
     cli.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="正文抓取并发数 (默认: 16，可按代理数量继续调高)",
+    )
+    cli.add_argument(
+        "--proxy",
+        action="append",
+        default=None,
+        help="代理，可重复传入，也支持逗号/分号分隔；支持 http://、https://、socks5://、socks5h://",
+    )
+    cli.add_argument(
+        "--proxy-file",
+        type=str,
+        default=None,
+        help="代理文件，每行一个代理",
+    )
+    cli.add_argument(
+        "--min-workers",
+        type=int,
+        default=1,
+        help="失败率高时自动降到的最小并发数 (默认: 1)",
+    )
+    cli.add_argument(
+        "--error-threshold",
+        type=float,
+        default=0.5,
+        help="单轮失败率达到该值时降低并发 (默认: 0.5)",
+    )
+    cli.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -172,6 +366,11 @@ def main():
         max_articles=args.max_articles,
         delay=args.delay,
         timeout=args.timeout,
+        workers=args.workers,
+        proxies=args.proxy,
+        proxy_file=args.proxy_file,
+        min_workers=args.min_workers,
+        error_threshold=args.error_threshold,
     )
 
     # 保存结果

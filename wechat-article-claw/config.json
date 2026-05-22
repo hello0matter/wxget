@@ -1,12 +1,21 @@
 {
   "targets": [
     {
-      "nickname": "宝医heart"
+      "nickname": "宝医社区健康管理"
     }
   ],
   "crawl_settings": {
     "batch_size": 5,
     "delay_seconds": 3,
+    "content_workers": 16,
+    "content_delay_seconds": 0,
+    "content_timeout": 20,
+    "content_max_retries": 3,
+    "content_adaptive": true,
+    "content_error_threshold": 0.5,
+    "content_min_workers": 4,
+    "content_proxies": [],
+    "content_proxy_file": "",
     "output_dir": "output"
   }
 }

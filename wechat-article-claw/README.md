@@ -32,9 +32,44 @@ python crawler.py --nickname "数字生命卡兹克" --since 2026-03-01
 
 # 日期 + 数量组合使用
 python crawler.py --nickname "数字生命卡兹克" --since 2026-03-01 --max 50
+
+# 高并发 + 多代理抓正文（正文阶段默认 16 线程）
+python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 24 --proxy http://127.0.0.1:7890 --proxy socks5h://127.0.0.1:1080
+
+# 从代理池文件读取，每行一个代理，也支持逗号/分号分隔
+python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 32 --proxy-file proxies.txt
 ```
 > **🤖 如果使用 AI Agent（示例）：**
 > 您可以直接给出自然语言需求：“请帮我抓取公众号《数字生命卡兹克》最新的 10 篇文章。” 或者 “帮我获取《某某科技》2026-03-01 以来的所有文章全文。”
+
+### 并发线程与代理配置
+
+正文抓取阶段默认开启高并发，`config.json` 里的默认值为 `content_workers: 16`、`content_delay_seconds: 0`。文章列表阶段仍按顺序翻页并保留 `delay_seconds`，避免微信公众平台接口频控。
+
+可用方式：
+- `--workers 24` 或 `--content-workers 24`：设置正文抓取线程数。
+- `--proxy http://host:port`：添加一个代理，可重复传入。
+- `--proxy "http://a:8080,socks5h://b:1080"`：一次传入多个代理。
+- `--proxy-file proxies.txt`：从文件读取代理，每行一个，`#` 开头为注释。
+- 支持 `http://`、`https://`、`socks5://`、`socks5h://`；未写协议时默认按 `http://` 处理。
+
+`config.json` 也可以直接配置：
+```json
+{
+  "crawl_settings": {
+    "content_workers": 32,
+    "content_delay_seconds": 0,
+    "content_min_workers": 4,
+    "content_proxies": [
+      "http://127.0.0.1:7890",
+      "socks5h://127.0.0.1:1080"
+    ],
+    "content_proxy_file": "proxies.txt"
+  }
+}
+```
+
+代理池会按文章序号轮询分配；如果失败率过高，默认会自动降并发，避免整批请求连续失败。
 
 ### 3. 获取登录凭证 (核心步骤)
 

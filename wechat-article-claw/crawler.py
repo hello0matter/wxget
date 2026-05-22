@@ -95,6 +95,66 @@ def get_credentials_smart(headless=False):
         sys.exit(1)
 
 
+def get_wechat_api_error(data):
+    """从微信接口响应中提取错误信息；响应正常时返回 None。"""
+    if not isinstance(data, dict):
+        return f"接口返回不是 JSON 对象: {type(data).__name__}"
+
+    base_resp = data.get("base_resp") or {}
+    ret = base_resp.get("ret", data.get("errcode", data.get("ret")))
+    err_msg = base_resp.get("err_msg", data.get("errmsg", data.get("err_msg", "")))
+
+    if ret in (None, 0, "0"):
+        return None
+
+    return f"ret={ret}, err_msg={err_msg or '未知错误'}"
+
+
+def is_freq_control_error(error):
+    """判断是否为微信后台接口频控。"""
+    text = str(error).lower()
+    return "ret=200013" in text or "freq control" in text
+
+
+def save_json_atomic(path, data):
+    """原子写入 JSON，避免中断时留下半截文件。"""
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(temp_path, path)
+
+
+def get_article_key(article):
+    """生成文章去重键，优先使用稳定的微信文章标识。"""
+    aid = article.get("aid")
+    if aid:
+        return ("aid", aid)
+
+    link = article.get("link") or article.get("url") or article.get("content_url")
+    if link:
+        return ("link", link)
+
+    appmsgid = article.get("appmsgid")
+    itemidx = article.get("itemidx")
+    if appmsgid is not None:
+        return ("appmsgid", str(appmsgid), str(itemidx or ""))
+
+    return ("fallback", article.get("title", ""), article.get("update_time") or article.get("create_time"))
+
+
+def build_article_list_result(nickname, articles, status, articles_sum=None, next_begin=None):
+    """构造列表阶段结果，供 checkpoint 与最终输出复用。"""
+    return {
+        "account": nickname,
+        "total": len(articles),
+        "reported_total": articles_sum,
+        "status": status,
+        "next_begin": next_begin,
+        "crawled_at": datetime.now().isoformat(),
+        "articles": articles,
+    }
+
+
 def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=None, since_date=None):
     """
     抓取指定公众号的全部文章 URL
@@ -116,9 +176,16 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     """
     batch_size = settings.get("batch_size", 5)
     delay = settings.get("delay_seconds", 3)
+    max_stalled_pages = settings.get("max_stalled_pages", 3)
+    list_freq_cooldown = settings.get("list_freq_cooldown_seconds", 60)
+    max_freq_retries = settings.get("list_max_freq_retries", 6)
     output_dir = settings.get("output_dir", "output")
 
     os.makedirs(output_dir, exist_ok=True)
+    safe_name = nickname.replace("/", "_").replace(" ", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(output_dir, f"{safe_name}_{timestamp}.json")
+    full_output_file = os.path.join(output_dir, f"{safe_name}_full_{timestamp}.json")
 
     print(f"\n{'='*50}")
     print(f"开始抓取公众号: {nickname}")
@@ -148,17 +215,41 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
             print("[!] 可能是 cookie/token 已过期，请重新提取")
             return []
 
-    # 2. 获取文章总数 (使用 fakeid 直接调用内部方法)
-    try:
-        data = paw._PublicAccountsWeb__get_articles_data("", begin="0", biz=fakeid)
-        articles_sum = data["app_msg_cnt"]
-    except Exception as e:
-        print(f"[✗] 获取文章总数失败: {e}")
-        print("[!] 可能是 cookie/token 已过期，请重新提取")
-        return []
+    # 2. 获取第一页文章和总数（微信接口有时不返回 app_msg_cnt，不能强依赖）
+    first_page_data = None
+    for retry_index in range(max_freq_retries + 1):
+        try:
+            first_page_data = paw._PublicAccountsWeb__get_articles_data(
+                "", begin="0", biz=fakeid, count=batch_size
+            )
+            api_error = get_wechat_api_error(first_page_data)
+            if api_error:
+                raise RuntimeError(api_error)
+            break
+        except Exception as e:
+            if is_freq_control_error(e) and retry_index < max_freq_retries:
+                cooldown = min(list_freq_cooldown * (retry_index + 1), 300)
+                print(f"[!] 获取文章列表触发频控，冷却 {cooldown} 秒后重试: {e}")
+                time.sleep(cooldown)
+                continue
 
-    # 如果设置了最大数量限制
-    if max_articles and max_articles < articles_sum:
+            print(f"[✗] 获取文章列表失败: {e}")
+            if is_freq_control_error(e):
+                print("[!] 这是微信频控，不是凭证过期；建议等 5~30 分钟后再试")
+            else:
+                print("[!] 可能是 cookie/token 已过期，请重新提取")
+            return []
+
+    first_page_articles = first_page_data.get("app_msg_list", [])
+    articles_sum = first_page_data.get("app_msg_cnt")
+    if articles_sum is not None:
+        articles_sum = int(articles_sum)
+
+    # 如果设置了最大数量限制；总数缺失时按分页抓到空列表或达到 max 为止
+    if articles_sum is None:
+        crawl_total = max_articles
+        print("[!] 微信接口未返回文章总数，将按分页抓取直到列表为空")
+    elif max_articles and max_articles < articles_sum:
         print(f"ℹ️  限制抓取数量: {max_articles}")
         crawl_total = max_articles
     else:
@@ -166,105 +257,191 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
 
     if since_date:
         print(f"📅 时间过滤: 仅抓取 {since_date.strftime('%Y-%m-%d')} 之后的文章")
-    print(f"📄 文章总数: {articles_sum}，本次抓取上限: {crawl_total}")
+    total_label = articles_sum if articles_sum is not None else "未知"
+    limit_label = crawl_total if crawl_total is not None else "自动翻页至末尾"
+    print(f"📄 文章总数: {total_label}，本次抓取上限: {limit_label}")
 
-    if articles_sum == 0:
+    if articles_sum == 0 or (articles_sum is None and not first_page_articles):
         print("[!] 未找到文章")
         return []
 
     # 3. 循环翻页获取全部文章
     all_articles = []
+    article_keys = set()
     failed_count = 0
+    freq_retry_count = 0
+    stalled_pages = 0
     reached_date_limit = False
+    interrupted = False
     since_ts = since_date.timestamp() if since_date else None
 
-    for begin in range(0, crawl_total, batch_size):
-        try:
-            # 使用 fakeid 直接调用，避免每次都搜索 nickname
-            data = paw._PublicAccountsWeb__get_articles_data(
-                "", begin=str(begin), biz=fakeid, count=batch_size
-            )
-            article_data = data.get("app_msg_list", [])
+    save_json_atomic(
+        output_file,
+        build_article_list_result(nickname, all_articles, "in_progress", articles_sum, 0),
+    )
+    print(f"💾 列表会边抓边保存到: {output_file}")
 
-            # 按日期过滤（文章按时间倒序排列，遇到早于 since 的就停止）
-            if since_ts:
+    begin = 0
+    try:
+        while True:
+            try:
+                if begin == 0:
+                    data = first_page_data
+                else:
+                    # 使用 fakeid 直接调用，避免每次都搜索 nickname
+                    data = paw._PublicAccountsWeb__get_articles_data(
+                        "", begin=str(begin), biz=fakeid, count=batch_size
+                    )
+
+                api_error = get_wechat_api_error(data)
+                if api_error:
+                    raise RuntimeError(api_error)
+
+                article_data = data.get("app_msg_list", [])
+                if not article_data:
+                    print("  已到达列表末尾")
+                    break
+
+                new_article_count = 0
+                # 按日期过滤（文章按时间倒序排列，遇到早于 since 的就停止）
                 for article in article_data:
                     article_time = article.get("update_time") or article.get("create_time", 0)
-                    if article_time >= since_ts:
-                        all_articles.append(article)
-                    else:
+                    if since_ts and article_time < since_ts:
                         reached_date_limit = True
                         article_date = datetime.fromtimestamp(article_time).strftime('%Y-%m-%d')
                         print(f"  📅 遇到 {article_date} 的文章，已到达时间边界")
                         break
-            else:
-                all_articles.extend(article_data)
 
-            failed_count = 0
-            print(f"  进度: {len(all_articles)} 篇")
+                    article_key = get_article_key(article)
+                    if article_key in article_keys:
+                        continue
 
-            # 达到日期限制时停止
-            if reached_date_limit:
+                    article_keys.add(article_key)
+                    all_articles.append(article)
+                    new_article_count += 1
+
+                failed_count = 0
+                if new_article_count:
+                    stalled_pages = 0
+                else:
+                    stalled_pages += 1
+
+                print(f"  进度: {len(all_articles)} 篇 (+{new_article_count}，偏移 {begin})")
+                next_begin = begin + batch_size
+                save_json_atomic(
+                    output_file,
+                    build_article_list_result(
+                        nickname, all_articles, "in_progress", articles_sum, next_begin
+                    ),
+                )
+
+                # 达到日期限制时停止
+                if reached_date_limit:
+                    break
+
+                # 达到数量限制时截断
+                if max_articles and len(all_articles) >= max_articles:
+                    all_articles = all_articles[:max_articles]
+                    break
+
+                if stalled_pages >= max_stalled_pages:
+                    print(f"  [!] 连续 {stalled_pages} 批没有新文章，停止翻页")
+                    break
+            except Exception as e:
+                if is_freq_control_error(e):
+                    freq_retry_count += 1
+                    if freq_retry_count > max_freq_retries:
+                        print(f"  [!] 频控重试超过 {max_freq_retries} 次，先停止列表抓取")
+                        break
+
+                    cooldown = min(list_freq_cooldown * freq_retry_count, 300)
+                    print(f"  [!] 第 {begin} 批触发频控，冷却 {cooldown} 秒后继续: {e}")
+                    save_json_atomic(
+                        output_file,
+                        build_article_list_result(
+                            nickname, all_articles, "rate_limited", articles_sum, begin
+                        ),
+                    )
+                    time.sleep(cooldown)
+                    continue
+
+                failed_count += 1
+                print(f"  [!] 第 {begin} 批获取失败: {e}")
+                if failed_count >= 3:
+                    print("[✗] 连续失败 3 次，停止抓取")
+                    print("[!] 如果不是频控，可能是 cookie/token 已过期，请重新提取")
+                    break
+                time.sleep(delay * 2)
+                continue
+
+            begin += batch_size
+            if crawl_total is not None and begin >= crawl_total:
                 break
 
-            # 达到数量限制时截断
-            if max_articles and len(all_articles) >= max_articles:
-                all_articles = all_articles[:max_articles]
+            if articles_sum is None and len(article_data) < batch_size:
+                print("  已到达列表末尾")
                 break
-        except Exception as e:
-            failed_count += 1
-            print(f"  [!] 第 {begin} 批获取失败: {e}")
-            if failed_count >= 3:
-                print("[✗] 连续失败 3 次，停止抓取")
-                print("[!] 可能是 cookie/token 已过期，请重新提取")
-                break
-            time.sleep(delay * 2)
-            continue
 
-        time.sleep(delay)
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[!] 已停止列表抓取，保留当前 checkpoint")
 
     # 4. 保存结果
-    safe_name = nickname.replace("/", "_").replace(" ", "_")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"{safe_name}_{timestamp}.json")
+    list_status = "interrupted" if interrupted else "completed"
+    save_json_atomic(
+        output_file,
+        build_article_list_result(nickname, all_articles, list_status, articles_sum, begin),
+    )
 
-    result = {
-        "account": nickname,
-        "total": len(all_articles),
-        "crawled_at": datetime.now().isoformat(),
-        "articles": all_articles,
-    }
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    print(f"\n✅ 第一阶段（文章列表）抓取完成!")
+    status_label = "已中断" if interrupted else "抓取完成"
+    print(f"\n✅ 第一阶段（文章列表）{status_label}!")
     print(f"   公众号: {nickname}")
     print(f"   文章数: {len(all_articles)}")
     print(f"   基础列表保存到: {output_file}")
+
+    if interrupted:
+        return all_articles
 
     # 5. 自动无缝进入第二阶段：请求文章内容（默认情况下）
     # 在 settings 中可以允许不请求正文，但通常大家都需要连贯的抓出正文
     skip_content = settings.get("skip_content", False)
     if not skip_content and all_articles:
-        results = fetch_all_content(
-            all_articles,
-            max_articles=len(all_articles),
-            delay=settings.get("content_delay_seconds", 2),
-            timeout=20
-        )
-        
-        # 将带正文的结果重新保存为 _content_XXXX.json
-        full_output_file = os.path.join(output_dir, f"{safe_name}_full_{timestamp}.json")
-        output_data = {
-            "account": nickname,
-            "total": len(results),
-            "success": sum(1 for r in results if r.get("content")),
-            "crawled_at": datetime.now().isoformat(),
-            "articles": results,
-        }
-        with open(full_output_file, "w", encoding="utf-8") as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        def save_content_checkpoint(results, status="in_progress"):
+            save_json_atomic(
+                full_output_file,
+                {
+                    "account": nickname,
+                    "total": len(results),
+                    "success": sum(1 for r in results if r.get("content")),
+                    "status": status,
+                    "crawled_at": datetime.now().isoformat(),
+                    "articles": results,
+                },
+            )
+
+        save_content_checkpoint([], status="in_progress")
+        print(f"💾 正文会边抓边保存到: {full_output_file}")
+        try:
+            results = fetch_all_content(
+                all_articles,
+                max_articles=len(all_articles),
+                delay=settings.get("content_delay_seconds", 2),
+                timeout=settings.get("content_timeout", 20),
+                max_retries=settings.get("content_max_retries", 3),
+                progress_callback=save_content_checkpoint,
+                workers=settings.get("content_workers", 16),
+                proxies=settings.get("content_proxies"),
+                proxy_file=settings.get("content_proxy_file"),
+                adaptive=settings.get("content_adaptive", True),
+                error_threshold=settings.get("content_error_threshold", 0.5),
+                min_workers=settings.get("content_min_workers", 1),
+            )
+        except KeyboardInterrupt:
+            print(f"\n[!] 已停止正文抓取，保留当前 checkpoint: {full_output_file}")
+            return all_articles
+
+        save_content_checkpoint(results, status="completed")
             
         print(f"\n✅ 第二阶段（文章纯文本详情）提取完毕！")
         print(f"   最终带有正文的数据已保存至: {full_output_file}")
@@ -328,11 +505,88 @@ def main():
         action="store_true",
         help="在无头模式下启动登录浏览器（适合云服务器无界面环境）",
     )
+    parser.add_argument(
+        "--relogin",
+        "-r",
+        action="store_true",
+        help="忽略已保存凭证，直接启动浏览器重新扫码登录",
+    )
+    parser.add_argument(
+        "--content-workers",
+        "--workers",
+        "-w",
+        type=int,
+        default=None,
+        dest="content_workers",
+        help="正文抓取并发数（默认读取 config；未配置时为 16）",
+    )
+    parser.add_argument(
+        "--content-proxy",
+        "--proxy",
+        "-p",
+        action="append",
+        default=None,
+        dest="content_proxy",
+        help="正文抓取代理，可重复传入，也支持逗号/分号分隔；支持 http://、https://、socks5://、socks5h://",
+    )
+    parser.add_argument(
+        "--content-proxy-file",
+        "--proxy-file",
+        "-pf",
+        type=str,
+        default=None,
+        dest="content_proxy_file",
+        help="正文抓取代理文件，每行一个代理",
+    )
+    parser.add_argument(
+        "--content-delay",
+        "-cd",
+        type=float,
+        default=None,
+        dest="content_delay",
+        help="正文抓取并发批次间隔秒数；并发时建议 0~1",
+    )
+    parser.add_argument(
+        "--list-delay",
+        "-ld",
+        type=float,
+        default=None,
+        dest="list_delay",
+        help="文章列表翻页间隔秒数；不建议低于 1，过快容易触发风控",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="快捷加速模式：正文至少 16 线程、正文批次间隔 0 秒、列表间隔 1 秒",
+    )
+    parser.add_argument(
+        "--cooldown",
+        "-fc",
+        type=float,
+        default=None,
+        help="列表接口触发频控后的基础冷却秒数（默认 60）",
+    )
     args = parser.parse_args()
 
     # 加载配置
     config = load_config(args.config)
     settings = config.get("crawl_settings", {})
+    if args.fast:
+        settings["content_workers"] = max(16, int(settings.get("content_workers", 16) or 16))
+        settings.setdefault("content_delay_seconds", 0)
+        settings.setdefault("delay_seconds", 1)
+    if args.content_workers is not None:
+        settings["content_workers"] = args.content_workers
+    if args.content_proxy is not None:
+        settings["content_proxies"] = args.content_proxy
+    if args.content_proxy_file is not None:
+        settings["content_proxy_file"] = args.content_proxy_file
+    if args.content_delay is not None:
+        settings["content_delay_seconds"] = args.content_delay
+    if args.list_delay is not None:
+        settings["delay_seconds"] = args.list_delay
+    if args.cooldown is not None:
+        settings["list_freq_cooldown_seconds"] = args.cooldown
     targets = config.get("targets", [])
 
     # 命令行指定的 nickname/fakeid 优先
@@ -352,6 +606,8 @@ def main():
         data = json.loads(args.credentials)
         cookie, token = data["cookie"], data["token"]
         save_credentials(cookie, token)
+    elif args.relogin:
+        cookie, token = get_credentials_auto(headless=args.headless)
     else:
         cookie, token = load_credentials()
         if not cookie or not token:

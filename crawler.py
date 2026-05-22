@@ -138,7 +138,10 @@ def safe_output_name(value):
 
 
 def article_url_value(article):
-    return article.get("link") or article.get("url") or article.get("content_url") or article.get("source_url") or ""
+    url = article.get("link") or article.get("url") or article.get("content_url") or article.get("source_url") or ""
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
 
 
 def get_article_key(article):
@@ -384,6 +387,14 @@ def merge_content_results(all_articles, existing_results, fetched_results):
     for article in all_articles:
         key = article_url_value(article)
         item = fetched_by_url.get(key) or existing_by_url.get(key)
+        if not item:
+            item = next(
+                (
+                    candidate for candidate in fetched_results
+                    if article_url_value(candidate).split("#", 1)[0] == key.split("#", 1)[0]
+                ),
+                None,
+            )
         if item:
             merged.append(item)
     return merged
@@ -484,12 +495,12 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     output_dir = settings.get("output_dir", "output")
 
     os.makedirs(output_dir, exist_ok=True)
-    safe_name = safe_output_name(output_name or nickname)
+    safe_name = safe_output_name(nickname)
     run_output_dir = choose_run_output_dir(
         output_dir,
         safe_name,
         settings,
-        fallback_names=[safe_output_name(nickname)],
+        fallback_names=[safe_output_name(output_name), safe_output_name(nickname)],
     )
     os.makedirs(run_output_dir, exist_ok=True)
     output_file = os.path.join(run_output_dir, "article_list.json")
@@ -1014,7 +1025,7 @@ def main():
             "  python .\\crawler.py -a by --new-run\n"
             "      不复用旧进度，重新开一个输出目录\n\n"
             "输出目录：\n"
-            "  output/by_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt 等。"
+            "  output/公众号名_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt 等。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,

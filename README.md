@@ -33,7 +33,7 @@ python crawler.py -a by
 # config.json 只有一个目标时，也可以直接运行
 python crawler.py
 
-# 默认自动续跑：复用最近一次 output/by_时间戳/ 里的进度
+# 默认自动续跑：复用最近一次 output/公众号名_时间戳/ 里的进度
 python crawler.py -a by
 
 # 如果确实想重新开一个全新任务目录
@@ -86,7 +86,7 @@ python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 32 --pro
 
 代理池会按文章序号轮询分配；如果失败率过高，默认会自动降并发，避免整批请求连续失败。
 
-### 短别名与短输出目录
+### 短别名
 
 `config.json` 的目标支持短别名：
 ```json
@@ -94,8 +94,7 @@ python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 32 --pro
   "targets": [
     {
       "nickname": "宝医社区健康管理",
-      "alias": "by",
-      "output_name": "by"
+      "alias": "by"
     }
   ]
 }
@@ -106,7 +105,7 @@ python crawler.py --nickname "数字生命卡兹克" --max 50 --workers 32 --pro
 python crawler.py -a by
 ```
 
-输出目录也会变短，例如 `output/by_20260522_120000/`。
+输出目录默认使用公众号名字，例如 `output/宝医社区健康管理_20260522_120000/`；`alias` 只负责让命令更短。
 
 ### 断点续跑
 

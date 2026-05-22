@@ -21,6 +21,20 @@ from datetime import datetime
 from read_wechat_article import WechatArticleFetcher, WechatArticleParser
 
 
+def summarize_fetch_error(fetched):
+    logs = fetched.get("logs") or {}
+    attempts = logs.get("attempts") or []
+    last_attempt = attempts[-1] if attempts else {}
+    status = logs.get("http_status") or last_attempt.get("status")
+    error_text = last_attempt.get("error") or fetched.get("message") or fetched.get("error", "unknown")
+    parts = [str(fetched.get("error", "unknown"))]
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    if error_text and error_text != fetched.get("error"):
+        parts.append(str(error_text))
+    return " / ".join(parts)
+
+
 def load_article_list(json_path):
     """加载 crawler.py 生成的文章列表 JSON"""
     with open(json_path, "r", encoding="utf-8") as f:
@@ -108,7 +122,8 @@ def fetch_one_article(article, article_index, total, timeout, max_retries, proxy
             "title": title,
             "url": url,
             "error": fetched["error"],
-            "message": fetched.get("message", fetched["error"]),
+            "message": summarize_fetch_error(fetched),
+            "logs": fetched.get("logs", {}),
             "content": None,
         }, False
 
@@ -262,7 +277,8 @@ def fetch_all_content(
                 else:
                     fail_count += 1
                     wave_fail_count += 1
-                    print(f"  [{article_index+1}/{total}] ❌ {title[:40]}... {result.get('message', result.get('error', 'unknown'))}")
+                    error_detail = result.get("message") or result.get("error") or "unknown"
+                    print(f"  [{article_index+1}/{total}] ❌ {title[:40]}... {error_detail}")
 
                 if progress_callback:
                     progress_callback(compact_results(results))

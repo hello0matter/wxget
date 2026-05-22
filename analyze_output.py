@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -151,6 +152,39 @@ def normalize_article(url):
     return url
 
 
+def normalize_proxy(proxy):
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return ""
+    if "://" not in proxy:
+        return f"http://{proxy}"
+    return proxy
+
+
+def load_proxy_pool(proxies=None, proxy_file=None):
+    proxy_pool = []
+    if proxies:
+        for item in proxies:
+            proxy_pool.extend(part.strip() for part in str(item).replace(";", ",").split(","))
+    if proxy_file:
+        proxy_path = Path(proxy_file)
+        if proxy_path.is_file():
+            with open(proxy_path, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        proxy_pool.extend(part.strip() for part in line.replace(";", ",").split(","))
+        else:
+            print(f"[!] 代理文件不存在，已跳过: {proxy_file}")
+    return [proxy for proxy in (normalize_proxy(item) for item in proxy_pool) if proxy]
+
+
+def pick_proxy(proxy_pool, article_index):
+    if not proxy_pool:
+        return None
+    return proxy_pool[(article_index - 1) % len(proxy_pool)]
+
+
 def article_container(soup):
     for kwargs in ({"id": "js_content"}, {"id": "img-content"}, {"class_": "rich_media_content"}):
         node = soup.find(**kwargs)
@@ -268,76 +302,173 @@ def dedupe_articles(articles):
     return result
 
 
-def analyze_articles(articles, account, args):
-    fetcher = WechatArticleFetcher(timeout=args.timeout, max_retries=args.retries, retry_delay=args.retry_delay)
+def analyze_one_article(raw_article, index, total, args, proxy=None):
+    fetcher = None
+    if args.refetch:
+        fetcher = WechatArticleFetcher(
+            timeout=args.timeout,
+            max_retries=args.retries,
+            retry_delay=args.retry_delay,
+            proxy=proxy,
+        )
     parser = WechatArticleParser()
+    original_url = raw_article["url"]
+    title_hint = raw_article.get("title", "")
+    log_item = {"index": index, "title": title_hint, "url": original_url, "status": "pending"}
+
+    detail = {
+        "index": index,
+        "title": title_hint,
+        "author": raw_article.get("author", ""),
+        "pub_time": raw_article.get("pub_time") or raw_article.get("update_time") or "",
+        "url": original_url,
+        "content": raw_article.get("content") or "",
+        "content_length": len(raw_article.get("content") or ""),
+        "fetch_status": "from_input",
+        "assets_count": 0,
+        "images_count": 0,
+        "miniprograms_count": 0,
+    }
+    if proxy:
+        log_item["proxy"] = proxy
+
+    page_html = ""
+    if args.refetch:
+        fetched = fetcher.fetch(original_url)
+        if "error" in fetched:
+            detail.update({"fetch_status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
+            log_item.update({"status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
+        else:
+            page_html = fetched.get("page_html", "")
+            parsed = parser.parse(page_html)
+            content = parsed.get("content") or detail["content"]
+            detail.update(
+                {
+                    "title": parsed.get("title") or detail["title"],
+                    "author": parsed.get("author") or detail["author"],
+                    "pub_time": parsed.get("pub_time") or detail["pub_time"],
+                    "url": fetched.get("source_url") or detail["url"],
+                    "content": content,
+                    "content_length": len(content or ""),
+                    "fetch_status": "ok",
+                }
+            )
+            log_item.update({"status": "ok", "http_status": fetched.get("status")})
+    else:
+        log_item.update({"status": "ok", "note": "no_refetch"})
+
+    assets = []
+    images = []
+    if page_html:
+        assets, miniprograms = extract_assets_from_html(page_html, index, detail)
+        detail["assets_count"] = len(assets)
+        detail["images_count"] = sum(1 for item in assets if item["resource_type"] == "image")
+        detail["miniprograms_count"] = len(miniprograms)
+        images = [item for item in assets if item["resource_type"] == "image"]
+
+    return index, detail, assets, images, log_item
+
+
+def analyze_articles(articles, account, args):
     selected = dedupe_articles(articles)
     if args.max:
         selected = selected[: args.max]
 
-    details = []
+    details = [None] * len(selected)
     all_assets = []
     all_images = []
-    logs = []
+    logs = [None] * len(selected)
     total = len(selected)
+    workers = max(1, int(args.workers or 16))
+    proxy_pool = load_proxy_pool(args.proxy, args.proxy_file)
+
     print(f"\n开始分析 {account}: {total} 篇")
+    if args.refetch:
+        print(f"⚡ 重抓并发: {workers} 线程")
+    if proxy_pool:
+        print(f"🌐 代理轮询: {len(proxy_pool)} 个代理（支持 HTTP/HTTPS/SOCKS5/SOCKS5H；未写协议默认 http://）")
 
-    for index, raw_article in enumerate(selected, 1):
-        original_url = raw_article["url"]
-        title_hint = raw_article.get("title", "")
-        log_item = {"index": index, "title": title_hint, "url": original_url, "status": "pending"}
-        print(f"  [{index}/{total}] {title_hint[:40] or original_url[:60]}")
-
-        detail = {
-            "index": index,
-            "title": title_hint,
-            "author": raw_article.get("author", ""),
-            "pub_time": raw_article.get("pub_time") or raw_article.get("update_time") or "",
-            "url": original_url,
-            "content": raw_article.get("content") or "",
-            "content_length": len(raw_article.get("content") or ""),
-            "fetch_status": "from_input",
-            "assets_count": 0,
-            "images_count": 0,
-            "miniprograms_count": 0,
-        }
-
-        page_html = ""
-        if args.refetch:
-            fetched = fetcher.fetch(original_url)
-            if "error" in fetched:
-                detail.update({"fetch_status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
-                log_item.update({"status": "error", "error": fetched.get("error"), "message": fetched.get("message", "")})
-            else:
-                page_html = fetched.get("page_html", "")
-                parsed = parser.parse(page_html)
-                content = parsed.get("content") or detail["content"]
-                detail.update(
-                    {
-                        "title": parsed.get("title") or detail["title"],
-                        "author": parsed.get("author") or detail["author"],
-                        "pub_time": parsed.get("pub_time") or detail["pub_time"],
-                        "url": fetched.get("source_url") or detail["url"],
-                        "content": content,
-                        "content_length": len(content or ""),
-                        "fetch_status": "ok",
-                    }
-                )
-                log_item.update({"status": "ok", "http_status": fetched.get("status")})
-        else:
-            log_item.update({"status": "ok", "note": "no_refetch"})
-
-        if page_html:
-            assets, miniprograms = extract_assets_from_html(page_html, index, detail)
-            detail["assets_count"] = len(assets)
-            detail["images_count"] = sum(1 for item in assets if item["resource_type"] == "image")
-            detail["miniprograms_count"] = len(miniprograms)
+    if workers == 1 or not args.refetch:
+        for index, raw_article in enumerate(selected, 1):
+            title_hint = raw_article.get("title", "")
+            print(f"  [{index}/{total}] {title_hint[:40] or raw_article['url'][:60]}")
+            _, detail, assets, images, log_item = analyze_one_article(
+                raw_article,
+                index,
+                total,
+                args,
+                proxy=pick_proxy(proxy_pool, index),
+            )
+            details[index - 1] = detail
+            logs[index - 1] = log_item
             all_assets.extend(assets)
-            all_images.extend([item for item in assets if item["resource_type"] == "image"])
+            all_images.extend(images)
+            if args.delay and index < total:
+                time.sleep(args.delay)
+        return details, all_assets, all_images, logs
 
-        details.append(detail)
-        logs.append(log_item)
-        if args.delay and index < total:
+    remaining_indices = list(range(1, total + 1))
+    while remaining_indices:
+        wave_size = min(len(remaining_indices), workers * 2)
+        wave_indices = remaining_indices[:wave_size]
+        remaining_indices = remaining_indices[wave_size:]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    analyze_one_article,
+                    selected[index - 1],
+                    index,
+                    total,
+                    args,
+                    pick_proxy(proxy_pool, index),
+                ): index
+                for index in wave_indices
+            }
+
+            for future in as_completed(future_map):
+                index = future_map[future]
+                raw_article = selected[index - 1]
+                title_hint = raw_article.get("title", "")
+                try:
+                    _, detail, assets, images, log_item = future.result()
+                except Exception as exc:
+                    detail = {
+                        "index": index,
+                        "title": title_hint,
+                        "author": raw_article.get("author", ""),
+                        "pub_time": raw_article.get("pub_time") or raw_article.get("update_time") or "",
+                        "url": raw_article["url"],
+                        "content": raw_article.get("content") or "",
+                        "content_length": len(raw_article.get("content") or ""),
+                        "fetch_status": "error",
+                        "error": "worker_exception",
+                        "message": str(exc),
+                        "assets_count": 0,
+                        "images_count": 0,
+                        "miniprograms_count": 0,
+                    }
+                    assets = []
+                    images = []
+                    log_item = {
+                        "index": index,
+                        "title": title_hint,
+                        "url": raw_article["url"],
+                        "status": "error",
+                        "error": "worker_exception",
+                        "message": str(exc),
+                    }
+
+                details[index - 1] = detail
+                logs[index - 1] = log_item
+                all_assets.extend(assets)
+                all_images.extend(images)
+                if log_item.get("status") == "ok":
+                    print(f"  [{index}/{total}] ✅ {title_hint[:40] or raw_article['url'][:60]}")
+                else:
+                    print(f"  [{index}/{total}] ❌ {title_hint[:40] or raw_article['url'][:60]} {log_item.get('message', log_item.get('error', 'unknown'))}")
+
+        if args.delay and remaining_indices:
             time.sleep(args.delay)
 
     return details, all_assets, all_images, logs
@@ -500,10 +631,19 @@ def parse_args():
     parser.add_argument("--project-dir", default=str(CLAW_DIR), help="wechat-article-claw 项目目录")
     parser.add_argument("--output-json-dir", default=None, help="JSON 输出目录；默认 project-dir/output")
     parser.add_argument("--max", type=int, default=None, help="最多处理文章数")
-    parser.add_argument("--delay", type=float, default=1.0, help="每篇间隔秒数")
+    parser.add_argument("--delay", type=float, default=0.0, help="并发批次间隔秒数，单线程时为每篇间隔秒数")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=1.0)
+    parser.add_argument("--workers", "-w", type=int, default=16, help="重抓页面并发线程数，默认 16")
+    parser.add_argument(
+        "--proxy",
+        "-p",
+        action="append",
+        default=None,
+        help="重抓页面代理，可重复传入，也支持逗号/分号分隔；支持 http://、https://、socks5://、socks5h://",
+    )
+    parser.add_argument("--proxy-file", "-pf", help="代理文件，每行一个代理，# 开头为注释")
     parser.add_argument("--no-refetch", dest="refetch", action="store_false", help="不重新请求页面，仅整理已有 JSON")
     parser.add_argument("--keep-json", action="store_true", help="额外保留原始 JSON 明细")
     parser.set_defaults(refetch=True)

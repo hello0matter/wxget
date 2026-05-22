@@ -1028,11 +1028,10 @@ def interactive_menu(args, config, settings):
     while True:
         print("\n请选择操作：")
         print(f"  1. 继续上次任务 / 默认抓取（{alias_label}，自动断点续跑）")
-        print("  2. 重新开始一个新任务")
+        print("  2. 输入公众号名称，重新开始一个新任务")
         print("  3. 只读取历史任务并生成/补全分析报告")
         print("  4. 查看历史任务目录")
         print("  5. 查看帮助")
-        print("  6. 输入公众号名称临时抓取（不用改 config.json）")
         print("  0. 退出")
         choice = input("输入编号（回车=1）：").strip()
         if not choice:
@@ -1045,6 +1044,13 @@ def interactive_menu(args, config, settings):
             args.no_resume = False
             return run_crawl_with_args(args, config, settings)
         if choice == "2":
+            nickname = input("请输入公众号名称（需精确匹配）：").strip()
+            if not nickname:
+                print("[!] 公众号名称不能为空")
+                continue
+            args.nickname = nickname
+            args.alias = None
+            args.target = None
             args.new_run = True
             args.no_resume = True
             settings["new_run"] = True
@@ -1071,20 +1077,7 @@ def interactive_menu(args, config, settings):
         if choice == "5":
             print("运行 python .\\crawler.py --help 查看完整参数说明。")
             continue
-        if choice == "6":
-            nickname = input("请输入公众号名称（需精确匹配）：").strip()
-            if not nickname:
-                print("[!] 公众号名称不能为空")
-                continue
-            args.nickname = nickname
-            args.alias = None
-            args.target = None
-            args.new_run = False
-            args.no_resume = False
-            settings["new_run"] = False
-            settings["resume"] = True
-            return run_crawl_with_args(args, config, settings)
-        print("请输入 0-6 之间的编号。")
+        print("请输入 0-5 之间的编号。")
 
 
 def main():
@@ -1097,7 +1090,7 @@ def main():
         epilog=(
             "常用示例：\n"
             "  python .\\crawler.py\n"
-            "      进入交互菜单，可选择继续上次、重新抓、只分析历史任务\n\n"
+            "      进入交互菜单；选 2 时直接输入公众号名称并新建任务\n\n"
             "  python .\\crawler.py -a by\n"
             "      使用短别名 by 抓取，默认自动续跑旧进度\n\n"
             "  python .\\crawler.py --nickname \"公众号名称\"\n"

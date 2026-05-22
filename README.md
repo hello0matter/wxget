@@ -21,10 +21,10 @@ playwright install chromium
 
 在终端运行主程序并指定目标公众号名称：
 ```bash
-# 进入交互菜单：继续上次、重新抓、只分析历史任务
+# 进入交互菜单：继续上次、输入公众号新建任务、只分析历史任务
 python crawler.py
 
-# 菜单中可选“6”，直接输入公众号名称临时抓取，不用改 config.json
+# 菜单中选“2”，直接输入公众号名称新建任务，不用改 config.json
 
 # 直接执行，不进菜单
 python crawler.py -a by --no-menu

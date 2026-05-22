@@ -30,6 +30,12 @@ python crawler.py -a by
 # config.json 只有一个目标时，也可以直接运行
 python crawler.py
 
+# 默认自动续跑：复用最近一次 output/by_时间戳/ 里的进度
+python crawler.py -a by
+
+# 如果确实想重新开一个全新任务目录
+python crawler.py -a by --new-run
+
 # 仅获取最新的 10 篇文章
 python crawler.py --nickname "数字生命卡兹克" --max 10
 
@@ -98,6 +104,20 @@ python crawler.py -a by
 ```
 
 输出目录也会变短，例如 `output/by_20260522_120000/`。
+
+### 断点续跑
+
+默认开启断点续跑。再次运行同一个别名时，会自动找最近的 `output/别名_时间戳/`：
+- `article_list.json` 已完成：跳过文章列表阶段。
+- `article_full.json` 已完成：跳过正文抓取阶段。
+- 只有部分正文：只补缺失正文，不重新抓已有正文。
+- `分析报告.md`、`非微信网络资产.txt`、`图片资源/本地图片清单.txt` 都存在：跳过分析阶段。
+- 旧版 `output/公众号_时间戳.json` / `output/公众号_full_时间戳.json` 会自动迁移成新的续跑目录。
+
+强制重新开始时使用：
+```bash
+python crawler.py -a by --new-run
+```
 
 ### 3. 获取登录凭证 (核心步骤)
 

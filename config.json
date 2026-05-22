@@ -9,6 +9,8 @@
   "crawl_settings": {
     "batch_size": 5,
     "delay_seconds": 3,
+    "resume": true,
+    "new_run": false,
     "content_workers": 16,
     "content_delay_seconds": 0,
     "content_timeout": 20,
@@ -23,6 +25,7 @@
     "analysis_workers": 16,
     "analysis_keep_json": false,
     "analysis_download_images": true,
+    "analysis_skip_existing": true,
     "analysis_image_download_timeout": 20,
     "analysis_image_download_max": null,
     "output_dir": "output"

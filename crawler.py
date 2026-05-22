@@ -125,6 +125,21 @@ def save_json_atomic(path, data):
     os.replace(temp_path, path)
 
 
+def load_json_file(path):
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def safe_output_name(value):
+    return (value or "unknown").replace("/", "_").replace(" ", "_")
+
+
+def article_url_value(article):
+    return article.get("link") or article.get("url") or article.get("content_url") or article.get("source_url") or ""
+
+
 def get_article_key(article):
     """生成文章去重键，优先使用稳定的微信文章标识。"""
     aid = article.get("aid")
@@ -143,6 +158,140 @@ def get_article_key(article):
     return ("fallback", article.get("title", ""), article.get("update_time") or article.get("create_time"))
 
 
+def find_latest_run_dir(output_dir, safe_name):
+    if not os.path.isdir(output_dir):
+        return None
+    prefix = f"{safe_name}_"
+    candidates = []
+    for name in os.listdir(output_dir):
+        path = os.path.join(output_dir, name)
+        if not os.path.isdir(path) or not name.startswith(prefix):
+            continue
+        if os.path.exists(os.path.join(path, "article_list.json")) or os.path.exists(os.path.join(path, "article_full.json")):
+            candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: os.path.getmtime(path))
+
+
+def normalize_checkpoint_data(data, status="completed"):
+    if isinstance(data, dict):
+        articles = data.get("articles", [])
+        normalized = dict(data)
+        normalized.setdefault("status", status)
+        normalized.setdefault("total", len(articles))
+        normalized.setdefault("next_begin", len(articles))
+        return normalized
+    if isinstance(data, list):
+        return {
+            "account": "unknown",
+            "total": len(data),
+            "status": status,
+            "next_begin": len(data),
+            "crawled_at": datetime.now().isoformat(),
+            "articles": data,
+        }
+    return data
+
+
+def find_latest_legacy_json(output_dir, candidate_names, full=False):
+    if not os.path.isdir(output_dir):
+        return None
+    matches = []
+    for name in os.listdir(output_dir):
+        path = os.path.join(output_dir, name)
+        if not os.path.isfile(path) or not name.endswith(".json"):
+            continue
+        for candidate_name in candidate_names:
+            if not candidate_name:
+                continue
+            if full and name.startswith(f"{candidate_name}_full_"):
+                matches.append(path)
+            elif not full and name.startswith(f"{candidate_name}_") and "_full_" not in name:
+                matches.append(path)
+    if not matches:
+        return None
+    return max(matches, key=lambda path: os.path.getmtime(path))
+
+
+def migrate_legacy_checkpoints(output_dir, safe_name, candidate_names):
+    candidate_names = [name for name in [safe_name, *(candidate_names or [])] if name]
+    legacy_list = find_latest_legacy_json(output_dir, candidate_names, full=False)
+    legacy_full = find_latest_legacy_json(output_dir, candidate_names, full=True)
+    if not legacy_list and not legacy_full:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_dir, f"{safe_name}_resume_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    list_source = legacy_list or legacy_full
+    if list_source:
+        save_json_atomic(
+            os.path.join(run_dir, "article_list.json"),
+            normalize_checkpoint_data(load_json_file(list_source), status="completed"),
+        )
+    if legacy_full:
+        save_json_atomic(
+            os.path.join(run_dir, "article_full.json"),
+            normalize_checkpoint_data(load_json_file(legacy_full), status="completed"),
+        )
+    print(f"↩️  已迁移旧版进度到: {run_dir}")
+    return run_dir
+
+
+def choose_run_output_dir(output_dir, safe_name, settings, fallback_names=None):
+    if settings.get("resume", True) and not settings.get("new_run", False):
+        candidate_names = [safe_name, *(fallback_names or [])]
+        latest_dirs = [
+            find_latest_run_dir(output_dir, candidate_name)
+            for candidate_name in candidate_names
+            if candidate_name
+        ]
+        latest_dirs = [path for path in latest_dirs if path]
+        latest_dir = max(latest_dirs, key=lambda path: os.path.getmtime(path)) if latest_dirs else None
+        if latest_dir:
+            print(f"↩️  发现历史进度，自动续跑: {latest_dir}")
+            return latest_dir
+        migrated_dir = migrate_legacy_checkpoints(output_dir, safe_name, candidate_names)
+        if migrated_dir:
+            return migrated_dir
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(output_dir, f"{safe_name}_{timestamp}")
+
+
+def has_reusable_list_checkpoint(target, settings, max_articles=None):
+    if not settings.get("resume", True) or settings.get("new_run", False):
+        return False
+    output_dir = settings.get("output_dir", "output")
+    safe_name = safe_output_name(target.get("output_name") or target.get("alias") or target.get("nickname"))
+    fallback_names = [
+        safe_output_name(target.get("nickname")),
+        safe_output_name(target.get("alias")),
+        safe_output_name(target.get("output_name")),
+    ]
+    latest_dirs = [
+        find_latest_run_dir(output_dir, candidate_name)
+        for candidate_name in [safe_name, *fallback_names]
+        if candidate_name
+    ]
+    latest_dirs = [path for path in latest_dirs if path]
+    latest_dir = max(latest_dirs, key=lambda path: os.path.getmtime(path)) if latest_dirs else None
+    if not latest_dir:
+        legacy_list = find_latest_legacy_json(output_dir, [safe_name, *fallback_names], full=False)
+        legacy_full = find_latest_legacy_json(output_dir, [safe_name, *fallback_names], full=True)
+        if legacy_list or legacy_full:
+            return True
+    if not latest_dir:
+        return False
+    checkpoint = load_json_file(os.path.join(latest_dir, "article_list.json"))
+    if not isinstance(checkpoint, dict) or not checkpoint.get("articles"):
+        return False
+    if checkpoint.get("status") == "completed":
+        return True
+    return bool(max_articles and len(checkpoint.get("articles", [])) >= max_articles)
+
+
 def build_article_list_result(nickname, articles, status, articles_sum=None, next_begin=None):
     """构造列表阶段结果，供 checkpoint 与最终输出复用。"""
     return {
@@ -156,10 +305,45 @@ def build_article_list_result(nickname, articles, status, articles_sum=None, nex
     }
 
 
+def merge_content_results(all_articles, existing_results, fetched_results):
+    fetched_by_url = {article_url_value(item): item for item in fetched_results if article_url_value(item)}
+    existing_by_url = {article_url_value(item): item for item in existing_results if article_url_value(item)}
+    merged = []
+    for article in all_articles:
+        key = article_url_value(article)
+        item = fetched_by_url.get(key) or existing_by_url.get(key)
+        if item:
+            merged.append(item)
+    return merged
+
+
+def filter_pending_content_articles(all_articles, existing_results):
+    existing_by_url = {
+        article_url_value(item): item
+        for item in existing_results
+        if article_url_value(item) and item.get("content")
+    }
+    pending = []
+    for article in all_articles:
+        key = article_url_value(article)
+        if not key or key not in existing_by_url:
+            pending.append(article)
+    return pending
+
+
 def run_analysis_report(nickname, full_output_file, articles, report_dir, settings):
     """爬取完成后自动生成 analyze_output 同款资产报告。"""
     if not settings.get("analyze_after_crawl", True):
         return None
+    if settings.get("analysis_skip_existing", True):
+        required_report_files = [
+            os.path.join(report_dir, "分析报告.md"),
+            os.path.join(report_dir, "非微信网络资产.txt"),
+            os.path.join(report_dir, "图片资源", "本地图片清单.txt"),
+        ]
+        if all(os.path.exists(path) for path in required_report_files):
+            print(f"✅ 分析报告已存在，跳过第三阶段: {report_dir}")
+            return None
 
     try:
         from analysis_report import analyze_articles, save_reports
@@ -226,81 +410,102 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     output_dir = settings.get("output_dir", "output")
 
     os.makedirs(output_dir, exist_ok=True)
-    safe_name_source = output_name or nickname
-    safe_name = safe_name_source.replace("/", "_").replace(" ", "_")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_output_dir = os.path.join(output_dir, f"{safe_name}_{timestamp}")
+    safe_name = safe_output_name(output_name or nickname)
+    run_output_dir = choose_run_output_dir(
+        output_dir,
+        safe_name,
+        settings,
+        fallback_names=[safe_output_name(nickname)],
+    )
     os.makedirs(run_output_dir, exist_ok=True)
     output_file = os.path.join(run_output_dir, "article_list.json")
     full_output_file = os.path.join(run_output_dir, "article_full.json")
+    list_checkpoint = load_json_file(output_file)
+    full_checkpoint = load_json_file(full_output_file)
 
     print(f"\n{'='*50}")
     print(f"开始抓取公众号: {nickname}")
     print(f"{'='*50}")
 
-    paw = PublicAccountsWeb(cookie=cookie, token=token)
+    list_checkpoint_completed = (
+        isinstance(list_checkpoint, dict)
+        and list_checkpoint.get("articles")
+        and (
+            list_checkpoint.get("status") == "completed"
+            or (max_articles and len(list_checkpoint.get("articles", [])) >= max_articles)
+        )
+    )
 
-    # 1. 确定 fakeid
-    if fakeid:
-        # 手动提供了 fakeid，跳过搜索
-        print(f"  使用提供的 FakeID: {fakeid}")
+    if list_checkpoint_completed:
+        print("✅ 已有完整文章列表，跳过微信列表接口")
+        first_page_data = {"app_msg_list": list_checkpoint.get("articles", [])[:batch_size]}
+        first_page_articles = first_page_data["app_msg_list"]
+        articles_sum = list_checkpoint.get("reported_total") or len(list_checkpoint.get("articles", []))
+        crawl_total = min(max_articles, len(list_checkpoint.get("articles", []))) if max_articles else len(list_checkpoint.get("articles", []))
     else:
-        # 通过 nickname 搜索 fakeid
-        try:
-            info = paw.official_info(nickname)
-            if info:
-                found = info[0]
-                fakeid = found['fakeid']
-                print(f"  公众号: {found['nickname']}")
-                print(f"  FakeID: {fakeid}")
-                print(f"  [提示] 下次可在 config.json 中填入 fakeid 跳过搜索")
-            else:
-                print(f"[✗] 未找到公众号: {nickname}")
-                return []
-        except Exception as e:
-            print(f"[✗] 查询公众号失败: {e}")
-            print("[!] 可能是 cookie/token 已过期，请重新提取")
-            return []
+        paw = PublicAccountsWeb(cookie=cookie, token=token)
 
-    # 2. 获取第一页文章和总数（微信接口有时不返回 app_msg_cnt，不能强依赖）
-    first_page_data = None
-    for retry_index in range(max_freq_retries + 1):
-        try:
-            first_page_data = paw._PublicAccountsWeb__get_articles_data(
-                "", begin="0", biz=fakeid, count=batch_size
-            )
-            api_error = get_wechat_api_error(first_page_data)
-            if api_error:
-                raise RuntimeError(api_error)
-            break
-        except Exception as e:
-            if is_freq_control_error(e) and retry_index < max_freq_retries:
-                cooldown = min(list_freq_cooldown * (retry_index + 1), 300)
-                print(f"[!] 获取文章列表触发频控，冷却 {cooldown} 秒后重试: {e}")
-                time.sleep(cooldown)
-                continue
-
-            print(f"[✗] 获取文章列表失败: {e}")
-            if is_freq_control_error(e):
-                print("[!] 这是微信频控，不是凭证过期；建议等 5~30 分钟后再试")
-            else:
+        # 1. 确定 fakeid
+        if fakeid:
+            # 手动提供了 fakeid，跳过搜索
+            print(f"  使用提供的 FakeID: {fakeid}")
+        else:
+            # 通过 nickname 搜索 fakeid
+            try:
+                info = paw.official_info(nickname)
+                if info:
+                    found = info[0]
+                    fakeid = found['fakeid']
+                    print(f"  公众号: {found['nickname']}")
+                    print(f"  FakeID: {fakeid}")
+                    print(f"  [提示] 下次可在 config.json 中填入 fakeid 跳过搜索")
+                else:
+                    print(f"[✗] 未找到公众号: {nickname}")
+                    return []
+            except Exception as e:
+                print(f"[✗] 查询公众号失败: {e}")
                 print("[!] 可能是 cookie/token 已过期，请重新提取")
-            return []
+                return []
 
-    first_page_articles = first_page_data.get("app_msg_list", [])
-    articles_sum = first_page_data.get("app_msg_cnt")
-    if articles_sum is not None:
-        articles_sum = int(articles_sum)
+        # 2. 获取第一页文章和总数（微信接口有时不返回 app_msg_cnt，不能强依赖）
+        first_page_data = None
+        for retry_index in range(max_freq_retries + 1):
+            try:
+                first_page_data = paw._PublicAccountsWeb__get_articles_data(
+                    "", begin="0", biz=fakeid, count=batch_size
+                )
+                api_error = get_wechat_api_error(first_page_data)
+                if api_error:
+                    raise RuntimeError(api_error)
+                break
+            except Exception as e:
+                if is_freq_control_error(e) and retry_index < max_freq_retries:
+                    cooldown = min(list_freq_cooldown * (retry_index + 1), 300)
+                    print(f"[!] 获取文章列表触发频控，冷却 {cooldown} 秒后重试: {e}")
+                    time.sleep(cooldown)
+                    continue
 
-    # 如果设置了最大数量限制；总数缺失时按分页抓到空列表或达到 max 为止
-    if articles_sum is None:
-        crawl_total = max_articles
-        print("[!] 微信接口未返回文章总数，将按分页抓取直到列表为空")
-    elif max_articles and max_articles < articles_sum:
-        print(f"ℹ️  限制抓取数量: {max_articles}")
-        crawl_total = max_articles
-    else:
-        crawl_total = articles_sum
+                print(f"[✗] 获取文章列表失败: {e}")
+                if is_freq_control_error(e):
+                    print("[!] 这是微信频控，不是凭证过期；建议等 5~30 分钟后再试")
+                else:
+                    print("[!] 可能是 cookie/token 已过期，请重新提取")
+                return []
+
+        first_page_articles = first_page_data.get("app_msg_list", [])
+        articles_sum = first_page_data.get("app_msg_cnt")
+        if articles_sum is not None:
+            articles_sum = int(articles_sum)
+
+        # 如果设置了最大数量限制；总数缺失时按分页抓到空列表或达到 max 为止
+        if articles_sum is None:
+            crawl_total = max_articles
+            print("[!] 微信接口未返回文章总数，将按分页抓取直到列表为空")
+        elif max_articles and max_articles < articles_sum:
+            print(f"ℹ️  限制抓取数量: {max_articles}")
+            crawl_total = max_articles
+        else:
+            crawl_total = articles_sum
 
     if since_date:
         print(f"📅 时间过滤: 仅抓取 {since_date.strftime('%Y-%m-%d')} 之后的文章")
@@ -312,7 +517,7 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
         print("[!] 未找到文章")
         return []
 
-    # 3. 循环翻页获取全部文章
+    # 3. 循环翻页获取全部文章；如果存在 checkpoint，则自动续跑
     all_articles = []
     article_keys = set()
     failed_count = 0
@@ -322,15 +527,29 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     interrupted = False
     since_ts = since_date.timestamp() if since_date else None
 
-    save_json_atomic(
-        output_file,
-        build_article_list_result(nickname, all_articles, "in_progress", articles_sum, 0),
-    )
+    begin = 0
+    list_finished = False
+    if isinstance(list_checkpoint, dict) and list_checkpoint.get("articles"):
+        all_articles = list_checkpoint.get("articles", [])
+        article_keys = {get_article_key(article) for article in all_articles}
+        begin = int(list_checkpoint.get("next_begin") or len(all_articles) or 0)
+        list_status = list_checkpoint.get("status", "")
+        if max_articles and len(all_articles) >= max_articles:
+            all_articles = all_articles[:max_articles]
+            list_finished = True
+        elif list_status == "completed":
+            list_finished = True
+        print(f"↩️  已载入列表进度: {len(all_articles)} 篇，状态 {list_status or 'unknown'}，下次偏移 {begin}")
+
+    if not all_articles:
+        save_json_atomic(
+            output_file,
+            build_article_list_result(nickname, all_articles, "in_progress", articles_sum, 0),
+        )
     print(f"💾 列表会边抓边保存到: {output_file}")
 
-    begin = 0
     try:
-        while True:
+        while not list_finished:
             try:
                 if begin == 0:
                     data = first_page_data
@@ -454,6 +673,16 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     # 在 settings 中可以允许不请求正文，但通常大家都需要连贯的抓出正文
     skip_content = settings.get("skip_content", False)
     if not skip_content and all_articles:
+        existing_content_results = []
+        content_finished = False
+        if isinstance(full_checkpoint, dict) and full_checkpoint.get("articles"):
+            existing_content_results = full_checkpoint.get("articles", [])
+            content_status = full_checkpoint.get("status", "")
+            content_finished = content_status == "completed" and len(existing_content_results) >= len(all_articles)
+            print(
+                f"↩️  已载入正文进度: {len(existing_content_results)} / {len(all_articles)}，状态 {content_status or 'unknown'}"
+            )
+
         def save_content_checkpoint(results, status="in_progress"):
             save_json_atomic(
                 full_output_file,
@@ -467,26 +696,39 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
                 },
             )
 
-        save_content_checkpoint([], status="in_progress")
-        print(f"💾 正文会边抓边保存到: {full_output_file}")
-        try:
-            results = fetch_all_content(
-                all_articles,
-                max_articles=len(all_articles),
-                delay=settings.get("content_delay_seconds", 2),
-                timeout=settings.get("content_timeout", 20),
-                max_retries=settings.get("content_max_retries", 3),
-                progress_callback=save_content_checkpoint,
-                workers=settings.get("content_workers", 16),
-                proxies=settings.get("content_proxies"),
-                proxy_file=settings.get("content_proxy_file"),
-                adaptive=settings.get("content_adaptive", True),
-                error_threshold=settings.get("content_error_threshold", 0.5),
-                min_workers=settings.get("content_min_workers", 1),
-            )
-        except KeyboardInterrupt:
-            print(f"\n[!] 已停止正文抓取，保留当前 checkpoint: {full_output_file}")
-            return all_articles
+        if content_finished:
+            results = existing_content_results
+            print(f"✅ 正文已完成，跳过第二阶段: {full_output_file}")
+        else:
+            pending_articles = filter_pending_content_articles(all_articles, existing_content_results)
+            if existing_content_results:
+                save_content_checkpoint(existing_content_results, status="in_progress")
+            else:
+                save_content_checkpoint([], status="in_progress")
+            print(f"💾 正文会边抓边保存到: {full_output_file}")
+            print(f"📖 待补正文: {len(pending_articles)} / {len(all_articles)} 篇")
+            try:
+                fetched_results = fetch_all_content(
+                    pending_articles,
+                    max_articles=len(pending_articles),
+                    delay=settings.get("content_delay_seconds", 2),
+                    timeout=settings.get("content_timeout", 20),
+                    max_retries=settings.get("content_max_retries", 3),
+                    progress_callback=lambda partial: save_content_checkpoint(
+                        merge_content_results(all_articles, existing_content_results, partial),
+                        status="in_progress",
+                    ),
+                    workers=settings.get("content_workers", 16),
+                    proxies=settings.get("content_proxies"),
+                    proxy_file=settings.get("content_proxy_file"),
+                    adaptive=settings.get("content_adaptive", True),
+                    error_threshold=settings.get("content_error_threshold", 0.5),
+                    min_workers=settings.get("content_min_workers", 1),
+                )
+                results = merge_content_results(all_articles, existing_content_results, fetched_results)
+            except KeyboardInterrupt:
+                print(f"\n[!] 已停止正文抓取，保留当前 checkpoint: {full_output_file}")
+                return all_articles
 
         save_content_checkpoint(results, status="completed")
             
@@ -638,6 +880,16 @@ def main():
         default=None,
         help="分析报告重抓页面并发数（默认跟随正文并发）",
     )
+    parser.add_argument(
+        "--new-run",
+        action="store_true",
+        help="不复用历史进度，强制创建新的时间戳输出目录",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="关闭自动续跑，等同于 --new-run",
+    )
     args = parser.parse_args()
 
     # 加载配置
@@ -663,6 +915,9 @@ def main():
         settings["analyze_after_crawl"] = False
     if args.analysis_workers is not None:
         settings["analysis_workers"] = args.analysis_workers
+    if args.new_run or args.no_resume:
+        settings["new_run"] = True
+        settings["resume"] = False
     targets = config.get("targets", [])
 
     # 命令行指定的 nickname/fakeid 优先
@@ -691,18 +946,6 @@ def main():
         print("    或者在 config.json 中配置 targets")
         sys.exit(1)
 
-    # 获取凭证
-    if args.credentials:
-        data = json.loads(args.credentials)
-        cookie, token = data["cookie"], data["token"]
-        save_credentials(cookie, token)
-    elif args.relogin:
-        cookie, token = get_credentials_auto(headless=args.headless)
-    else:
-        cookie, token = load_credentials()
-        if not cookie or not token:
-            cookie, token = get_credentials_smart(headless=args.headless)
-
     # 解析 since 日期
     since_date = None
     if args.since:
@@ -712,6 +955,28 @@ def main():
         except ValueError:
             print(f"[✗] 日期格式错误: {args.since}，请使用 YYYY-MM-DD 格式")
             sys.exit(1)
+
+    needs_credentials = bool(args.relogin or args.credentials)
+    if not needs_credentials:
+        needs_credentials = any(
+            not has_reusable_list_checkpoint(target, settings, args.max_articles)
+            for target in targets
+        )
+
+    # 获取凭证；如果只是基于完整 checkpoint 补正文/报告，则不需要登录态
+    if not needs_credentials:
+        cookie, token = None, None
+        print("↩️  检测到完整列表 checkpoint，本次续跑无需登录凭证")
+    elif args.credentials:
+        data = json.loads(args.credentials)
+        cookie, token = data["cookie"], data["token"]
+        save_credentials(cookie, token)
+    elif args.relogin:
+        cookie, token = get_credentials_auto(headless=args.headless)
+    else:
+        cookie, token = load_credentials()
+        if not cookie or not token:
+            cookie, token = get_credentials_smart(headless=args.headless)
 
     # 抓取
     for target in targets:

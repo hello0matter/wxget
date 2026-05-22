@@ -16,6 +16,10 @@
     "content_min_workers": 4,
     "content_proxies": [],
     "content_proxy_file": "",
+    "analyze_after_crawl": true,
+    "analysis_refetch": true,
+    "analysis_workers": 16,
+    "analysis_keep_json": false,
     "output_dir": "output"
   }
 }

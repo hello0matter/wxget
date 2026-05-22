@@ -13,6 +13,7 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from types import SimpleNamespace
 
 from fetch_content import fetch_all_content
 
@@ -155,6 +156,46 @@ def build_article_list_result(nickname, articles, status, articles_sum=None, nex
     }
 
 
+def run_analysis_report(nickname, full_output_file, articles, report_dir, settings):
+    """爬取完成后自动生成 analyze_output 同款资产报告。"""
+    if not settings.get("analyze_after_crawl", True):
+        return None
+
+    try:
+        from analysis_report import analyze_articles, save_reports
+    except ImportError as exc:
+        print(f"[!] 分析模块加载失败，已跳过资产报告: {exc}")
+        return None
+
+    analysis_args = SimpleNamespace(
+        max=None,
+        delay=settings.get("analysis_delay_seconds", settings.get("content_delay_seconds", 0)),
+        timeout=settings.get("analysis_timeout", settings.get("content_timeout", 20)),
+        retries=settings.get("analysis_retries", settings.get("content_max_retries", 3)),
+        retry_delay=settings.get("analysis_retry_delay", 1.0),
+        workers=settings.get("analysis_workers", settings.get("content_workers", 16)),
+        proxy=settings.get("analysis_proxies", settings.get("content_proxies")),
+        proxy_file=settings.get("analysis_proxy_file", settings.get("content_proxy_file")),
+        refetch=settings.get("analysis_refetch", True),
+    )
+
+    print(f"\n🔎 第三阶段：生成资产/图片/正文分析报告")
+    print(f"💾 分析报告目录: {report_dir}")
+    details, assets, images, logs = analyze_articles(articles, nickname, analysis_args)
+    summary = save_reports(
+        report_dir,
+        nickname,
+        full_output_file,
+        details,
+        assets,
+        images,
+        logs,
+        keep_json=settings.get("analysis_keep_json", False),
+    )
+    print(f"✅ 分析完成: 文章 {summary['articles']} / 资源 {summary['assets']} / 图片 {summary['images']}")
+    return summary
+
+
 def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=None, since_date=None):
     """
     抓取指定公众号的全部文章 URL
@@ -184,8 +225,10 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
     os.makedirs(output_dir, exist_ok=True)
     safe_name = nickname.replace("/", "_").replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"{safe_name}_{timestamp}.json")
-    full_output_file = os.path.join(output_dir, f"{safe_name}_full_{timestamp}.json")
+    run_output_dir = os.path.join(output_dir, f"{safe_name}_{timestamp}")
+    os.makedirs(run_output_dir, exist_ok=True)
+    output_file = os.path.join(run_output_dir, "article_list.json")
+    full_output_file = os.path.join(run_output_dir, "article_full.json")
 
     print(f"\n{'='*50}")
     print(f"开始抓取公众号: {nickname}")
@@ -446,6 +489,13 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
         print(f"\n✅ 第二阶段（文章纯文本详情）提取完毕！")
         print(f"   最终带有正文的数据已保存至: {full_output_file}")
 
+        try:
+            run_analysis_report(nickname, full_output_file, results, run_output_dir, settings)
+        except KeyboardInterrupt:
+            print(f"\n[!] 已停止分析报告生成，保留当前输出目录: {run_output_dir}")
+        except Exception as e:
+            print(f"[!] 分析报告生成失败，正文结果已保留: {e}")
+
 
     return all_articles
 
@@ -566,6 +616,17 @@ def main():
         default=None,
         help="列表接口触发频控后的基础冷却秒数（默认 60）",
     )
+    parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="爬完正文后不生成资产/图片分析报告",
+    )
+    parser.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=None,
+        help="分析报告重抓页面并发数（默认跟随正文并发）",
+    )
     args = parser.parse_args()
 
     # 加载配置
@@ -587,6 +648,10 @@ def main():
         settings["delay_seconds"] = args.list_delay
     if args.cooldown is not None:
         settings["list_freq_cooldown_seconds"] = args.cooldown
+    if args.skip_analysis:
+        settings["analyze_after_crawl"] = False
+    if args.analysis_workers is not None:
+        settings["analysis_workers"] = args.analysis_workers
     targets = config.get("targets", [])
 
     # 命令行指定的 nickname/fakeid 优先

@@ -128,7 +128,7 @@ python crawler.py --nickname "目标公众号" --skip-analysis
 ## 🛠 项目结构
 
 ```
-Crawler/
+wxget/
 ├── README.md           # 本文件
 ├── requirements.txt    # Python 依赖
 ├── config.json         # 目标公众号配置（历史遗留选项）

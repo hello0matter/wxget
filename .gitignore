@@ -3,3 +3,5 @@ credentials.json
 __pycache__/
 *.pyc
 .DS_Store
+.git-nested-backups/
+*_analysis_*/

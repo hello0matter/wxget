@@ -1,9 +1,9 @@
 # coding: utf-8
 """
-Analyze wechat-article-claw output JSON files and generate report files.
+Analyze crawler output JSON files and generate report files.
 
 Default behavior:
-  1. Scan ./wechat-article-claw/output/*.json
+  1. Scan ./output/*.json
   2. Ask the user to choose one JSON file
   3. Re-fetch article pages and extract text, images, links, and assets
   4. Write reports to this script's directory
@@ -36,7 +36,7 @@ if CLAW_DIR.exists():
 try:
     from read_wechat_article import WechatArticleFetcher, WechatArticleParser
 except ImportError as exc:
-    print(f"[x] 无法导入 wechat-article-claw/read_wechat_article.py: {exc}")
+    print(f"[x] 无法导入 read_wechat_article.py: {exc}")
     print(f"[x] 请确认项目目录存在: {CLAW_DIR}")
     raise
 
@@ -794,10 +794,10 @@ def save_reports(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="选择 wechat-article-claw/output JSON 并生成公众号文章资产报告")
+    parser = argparse.ArgumentParser(description="选择 output JSON 并生成公众号文章资产报告")
     parser.add_argument("-i", "--input", help="指定 JSON 文件；不指定则交互选择")
     parser.add_argument("-o", "--output-dir", help="报告输出目录；默认在当前目录生成")
-    parser.add_argument("--project-dir", default=str(CLAW_DIR), help="wechat-article-claw 项目目录")
+    parser.add_argument("--project-dir", default=str(CLAW_DIR), help="项目目录")
     parser.add_argument("--output-json-dir", default=None, help="JSON 输出目录；默认 project-dir/output")
     parser.add_argument("--max", type=int, default=None, help="最多处理文章数")
     parser.add_argument("--delay", type=float, default=0.0, help="并发批次间隔秒数，单线程时为每篇间隔秒数")

@@ -660,21 +660,37 @@ def collect_qr_image_candidates(images, downloaded_images):
 def decode_standard_qr_images(qr_candidates, image_dir):
     try:
         import cv2
+        import numpy as np
     except ImportError:
         return [], "未安装 opencv-python，跳过标准二维码自动解码；可执行 pip install opencv-python 后重跑分析。"
 
+    try:
+        cv2.setLogLevel(0)
+    except Exception:
+        pass
+
     detector = cv2.QRCodeDetector()
     decoded_rows = []
+    skipped = 0
     for item in qr_candidates:
         local_file = item.get("local_file")
         if not local_file:
             continue
         image_path = image_dir.parent / local_file
         if not image_path.exists():
+            skipped += 1
+            continue
+        if image_path.suffix.lower() in {".gif", ".svg"}:
+            skipped += 1
             continue
         try:
-            image = cv2.imread(str(image_path))
+            image_bytes = np.fromfile(str(image_path), dtype=np.uint8)
+            if image_bytes.size == 0:
+                skipped += 1
+                continue
+            image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
             if image is None:
+                skipped += 1
                 continue
             decoded_text, points, _ = detector.detectAndDecode(image)
             if decoded_text:
@@ -682,8 +698,10 @@ def decode_standard_qr_images(qr_candidates, image_dir):
                 decoded["decoded_text"] = decoded_text
                 decoded_rows.append(decoded)
         except Exception:
+            skipped += 1
             continue
-    return decoded_rows, ""
+    note = f"已静默跳过 {skipped} 张 OpenCV 无法读取或不支持的图片（如 GIF/SVG/损坏文件/特殊格式）。" if skipped else ""
+    return decoded_rows, note
 
 
 def write_qr_candidates_text(path, rows):

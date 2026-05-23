@@ -24,7 +24,7 @@ playwright install chromium
 # 进入交互菜单：继续上次、输入公众号新建任务、只分析历史任务
 python crawler.py
 
-# 菜单中选“2”，直接输入公众号名称新建任务，不用改 config.json
+# 菜单中选“2”，输入完整公众号名称新建任务；不能只输入编号或纯数字，避免抓错号
 
 # 直接执行，不进菜单
 python crawler.py -a by --no-menu

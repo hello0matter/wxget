@@ -160,6 +160,27 @@ def safe_output_name(value):
     return (value or "unknown").replace("/", "_").replace(" ", "_")
 
 
+def is_invalid_nickname_input(value):
+    value = (value or "").strip()
+    return not value or value.isdigit()
+
+
+def find_exact_official_account(info, nickname):
+    nickname = (nickname or "").strip()
+    for item in info or []:
+        if (item.get("nickname") or "").strip() == nickname:
+            return item
+    return None
+
+
+def print_official_account_candidates(info):
+    if not info:
+        return
+    print("  搜索到了这些候选，但没有精确匹配：")
+    for index, item in enumerate(info[:10], 1):
+        print(f"    {index}. {item.get('nickname', '')}")
+
+
 def article_url_value(article):
     url = article.get("link") or article.get("url") or article.get("content_url") or article.get("source_url") or ""
     if url.startswith("http://"):
@@ -584,14 +605,16 @@ def crawl_account(cookie, token, nickname, settings, fakeid=None, max_articles=N
             # 通过 nickname 搜索 fakeid
             try:
                 info = paw.official_info(nickname)
-                if info:
-                    found = info[0]
+                found = find_exact_official_account(info, nickname)
+                if found:
                     fakeid = found['fakeid']
                     print(f"  公众号: {found['nickname']}")
                     print(f"  FakeID: {fakeid}")
                     print(f"  [提示] 下次可在 config.json 中填入 fakeid 跳过搜索")
                 else:
-                    print(f"[✗] 未找到公众号: {nickname}")
+                    print(f"[✗] 未找到精确匹配的公众号: {nickname}")
+                    print_official_account_candidates(info)
+                    print("[!] 为避免抓错公众号，已停止。请重新输入完整公众号名称。")
                     return []
             except Exception as e:
                 print(f"[✗] 查询公众号失败: {e}")
@@ -1046,8 +1069,8 @@ def interactive_menu(args, config, settings):
             return run_crawl_with_args(args, config, settings)
         if choice == "2":
             nickname = input("请输入公众号名称（需精确匹配）：").strip()
-            if not nickname:
-                print("[!] 公众号名称不能为空")
+            if is_invalid_nickname_input(nickname):
+                print("[!] 请输入完整公众号名称，不能只输入编号或纯数字。")
                 continue
             args.nickname = nickname
             args.alias = None

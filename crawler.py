@@ -466,7 +466,8 @@ def run_analysis_report(nickname, full_output_file, articles, report_dir, settin
     if settings.get("analysis_skip_existing", True):
         required_report_files = [
             os.path.join(report_dir, "分析报告.md"),
-            os.path.join(report_dir, "非微信网络资产.txt"),
+            os.path.join(report_dir, "先看这个_总览.txt"),
+            os.path.join(report_dir, "外部链接_精简.txt"),
             os.path.join(report_dir, "图片资源", "本地图片清单.txt"),
             os.path.join(report_dir, "图片资源", "疑似二维码小程序码图片.txt"),
             os.path.join(report_dir, "图片资源", "标准二维码解码结果.txt"),
@@ -1102,7 +1103,7 @@ def main():
             "  python .\\crawler.py -a by --new-run\n"
             "      不复用旧进度，重新开一个输出目录；若凭证过期会自动打开浏览器重新扫码\n\n"
             "输出目录：\n"
-            "  output/公众号名_时间戳/，包含 article_list.json、article_full.json、分析报告.md、非微信网络资产.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt 等。"
+            "  output/公众号名_时间戳/，优先看 先看这个_总览.txt、外部链接_精简.txt、图片资源/本地图片/、疑似二维码小程序码图片.txt。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,

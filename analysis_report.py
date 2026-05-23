@@ -780,6 +780,78 @@ def write_asset_text(path, rows, title):
             fp.write("\n")
 
 
+def write_simple_url_list(path, rows, title, description=""):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(title + "\n")
+        fp.write("=" * 80 + "\n")
+        if description:
+            fp.write(description + "\n")
+        fp.write("\n")
+        if not rows:
+            fp.write("未发现。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"{index}. {item.get('resource_value', '')}\n")
+
+
+def write_external_url_detail(path, rows):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write("外部链接详细清单\n")
+        fp.write("=" * 80 + "\n")
+        fp.write("说明：这里的“来源文章”是为了定位上下文，不把 mp.weixin.qq.com 当作外部资产。\n\n")
+        if not rows:
+            fp.write("未发现。\n")
+            return
+        for index, item in enumerate(rows, 1):
+            fp.write(f"[{index}] 外部链接：{item.get('resource_value', '')}\n")
+            fp.write(f"域名：{item.get('host', '')}\n")
+            fp.write(f"类型：{item.get('resource_type', '')}\n")
+            fp.write(f"来源文章：{item.get('first_article_title') or item.get('article_title', '')}\n")
+            fp.write(f"定位用微信文章链接（非外部资产）：{item.get('first_article_url') or item.get('article_url', '')}\n\n")
+
+
+def write_human_summary(path, account, summary, host_counts, type_counts, external_network, qr_candidates, decoded_qr):
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write("先看这个：结果总览\n")
+        fp.write("=" * 80 + "\n\n")
+        fp.write(f"公众号：{account}\n")
+        fp.write(f"文章数量：{summary['articles']}\n")
+        fp.write(f"正文成功：{summary['success']}\n")
+        fp.write(f"正文失败：{summary['errors']}\n")
+        fp.write(f"图片数量：{summary['images']}\n")
+        fp.write(f"本地图片下载成功：{summary['downloaded_images']}\n")
+        fp.write(f"疑似二维码/小程序码图片：{summary['qr_image_candidates']}\n")
+        fp.write(f"外部链接数量（已排除微信/Tencent 域名）：{summary['non_wechat_network_assets']}\n\n")
+
+        fp.write("推荐查看顺序：\n")
+        fp.write("1. 外部链接_精简.txt：只看外部 URL，一行一个。\n")
+        fp.write("2. 外部链接_详细.txt：看外部 URL 来自哪篇文章。\n")
+        fp.write("3. 图片资源/疑似二维码小程序码图片.txt：重点人工检查二维码、小程序码、海报图。\n")
+        fp.write("4. 图片资源/本地图片/：直接缩略图查看所有下载图片。\n")
+        fp.write("5. 分析报告.md：看完整文章与统计。\n\n")
+
+        fp.write("外部域名 Top 20：\n")
+        external_hosts = {}
+        for item in external_network:
+            host = item.get("host") or "unknown"
+            external_hosts[host] = external_hosts.get(host, 0) + 1
+        if external_hosts:
+            for host, count in sorted(external_hosts.items(), key=lambda kv: kv[1], reverse=True)[:20]:
+                fp.write(f"- {host}：{count}\n")
+        else:
+            fp.write("- 未发现外部域名\n")
+
+        fp.write("\n资源类型统计：\n")
+        if type_counts:
+            for name, count in sorted(type_counts.items(), key=lambda kv: kv[0]):
+                fp.write(f"- {name}：{count}\n")
+        else:
+            fp.write("- 未发现资源\n")
+
+        fp.write("\n说明：\n")
+        fp.write("- qpic.cn、qq.com、weixin.qq.com 等属于微信/Tencent 生态，图片会保留在本地图片，但不会列入“外部链接”。\n")
+        fp.write("- 微信小程序码通常不是标准二维码，自动解码可能为空，仍建议人工查看疑似清单。\n")
+
 def save_reports(
     report_dir,
     account,
@@ -892,16 +964,37 @@ def save_reports(
         for item in network:
             fp.write(item["resource_value"] + "\n")
 
-    with open(report_dir / "非微信网络资产.txt", "w", encoding="utf-8") as fp:
-        for item in external_network:
-            fp.write(item["resource_value"] + "\n")
+    write_simple_url_list(
+        report_dir / "非微信网络资产.txt",
+        external_network,
+        "外部链接精简清单（兼容旧文件名）",
+        "已排除 mp.weixin.qq.com、qpic.cn、qq.com、weixin.qq.com、gtimg.cn 等微信/Tencent 域名。",
+    )
+
+    write_human_summary(
+        report_dir / "先看这个_总览.txt",
+        account,
+        summary,
+        host_counts,
+        type_counts,
+        external_network,
+        qr_candidates,
+        decoded_qr,
+    )
+    write_simple_url_list(
+        report_dir / "外部链接_精简.txt",
+        external_network,
+        "外部链接精简清单",
+        "已排除 mp.weixin.qq.com、qpic.cn、qq.com、weixin.qq.com、gtimg.cn 等微信/Tencent 域名；一行一个，便于人工查看。",
+    )
+    write_external_url_detail(report_dir / "外部链接_详细.txt", external_network)
 
     write_asset_text(image_dir / "图片资源清单.txt", images, "图片资源清单")
     write_downloaded_images_text(image_dir / "本地图片清单.txt", downloaded_images)
     write_qr_candidates_text(image_dir / "疑似二维码小程序码图片.txt", qr_candidates)
     write_qr_decode_text(image_dir / "标准二维码解码结果.txt", decoded_qr, decoded_qr_note)
     write_asset_text(asset_dir / "全部资产清单.txt", assets, "全部资产清单")
-    write_asset_text(asset_dir / "非微信网络资产清单.txt", external_network, "非微信网络资产清单")
+    write_external_url_detail(asset_dir / "外部链接详细清单.txt", external_network)
 
     assets_by_type = {}
     for item in assets:
